@@ -1,0 +1,14 @@
+name: amplifier-resolve-docs
+stack: static-web-app
+
+deploy:
+  repo: "https://github.com/kenotron-ms/amplifier-app-resolve-docs-site"
+  ref: refs/heads/main
+
+frontend:
+  type: static-web-app
+  repo: "https://github.com/kenotron-ms/amplifier-app-resolve-docs-site"
+  branch: main
+  app_location: "/"
+  output_location: "dist"
+  build_command: "npm run build"
