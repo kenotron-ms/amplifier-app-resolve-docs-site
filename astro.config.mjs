@@ -2,9 +2,9 @@
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 
-// Amplifier Resolve documentation — docs.ampbox.io
+// Amplifier Resolve documentation — docs.resolve.amplifier.ms
 export default defineConfig({
-  site: "https://docs.ampbox.io",
+  site: "https://docs.resolve.amplifier.ms",
   integrations: [
     starlight({
       title: "Amplifier Resolve Documentation",
@@ -19,15 +19,6 @@ export default defineConfig({
       ],
       // Agent-readable outputs: /llms.txt (index) and /resolve/llms-full.txt (full corpus)
       customCss: ["./src/styles/custom.css"],
-      head: [
-        {
-          // Client-side auth guard: check /.auth/me and redirect to AAD login
-          // with the current URL as post_login_redirect_uri so the user lands
-          // back on the page they requested after signing in.
-          tag: "script",
-          content: `(function(){if(window.location.pathname.startsWith('/.auth/'))return;fetch('/.auth/me').then(function(r){return r.json()}).then(function(d){if(!d.clientPrincipal){var p=window.location.pathname+window.location.search+window.location.hash;window.location.replace('/.auth/login/aad?post_login_redirect_uri='+encodeURIComponent(p))}}).catch(function(){})})();`,
-        },
-      ],
       sidebar: [
         {
           label: "Resolve",
