@@ -1,0 +1,64 @@
+---
+title: "Amplifier Resolve"
+description: "The autonomous code-generation platform — build resolvers, submit instances, stream events, and verify results with reality checks."
+template: splash
+hero:
+  tagline: The autonomous code-generation platform. Submit a task, watch it work, verify the result.
+  actions:
+    - text: Get started
+      link: /resolve/
+      icon: right-arrow
+      variant: primary
+    - text: For AI agents (llms.txt)
+      link: /llms.txt
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+## Start here
+
+<CardGrid>
+  <Card title="Your first resolver" icon="rocket">
+    From zero to a running custom resolver in one sitting — manifest, protocol, events, registration.
+
+    [Build a resolver →](/resolve/get-started/first-resolver/)
+  </Card>
+  <Card title="Run a reality check" icon="approve-check">
+    Verify that generated software actually meets your acceptance criteria — clean-room deploy, real verdict.
+
+    [Run a reality check →](/resolve/get-started/reality-check/)
+  </Card>
+  <Card title="Core concepts" icon="open-book">
+    Instances, resolvers, events, viewports, pipelines — the mental model in five minutes.
+
+    [Learn the concepts →](/resolve/get-started/concepts/)
+  </Card>
+  <Card title="REST API Reference" icon="list-format">
+    Every endpoint, every field, every status code. Resolver discovery, instance lifecycle, SSE events.
+
+    [API reference →](/resolve/use/api/)
+  </Card>
+</CardGrid>
+
+## The platform in one paragraph
+
+You submit a **task** as an [instance](/resolve/get-started/concepts/) targeting a registered [resolver](/resolve/build/resolver-protocol/). The platform spawns an isolated Incus container, runs your resolver's `run()` inside it, and streams a live [event feed](/resolve/build/events/) back to you. When the resolver finishes it delivers an artifact — typically a pull request. Run a [reality check](/resolve/use/reality-check/) to verify the result actually works before merging.
+
+## For AI agents
+
+The entire documentation corpus is available as a single fetch — no crawling required:
+
+<LinkCard
+  title="/resolve/llms-full.txt"
+  href="/resolve/llms-full.txt"
+  description="The complete Resolve documentation corpus — all pages concatenated into one request. Use this to author a resolver or drive the platform from an agent."
+  target="_blank"
+/>
+<LinkCard
+  title="/llms.txt"
+  href="/llms.txt"
+  description="Section-level index with links to individual pages. Use this for targeted lookups."
+  target="_blank"
+/>

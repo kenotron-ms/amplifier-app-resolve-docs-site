@@ -1,0 +1,329 @@
+---
+title: "Authoring Instance Specs"
+description: "How to write feature specifications that Resolve can reliably implement — observable behavior, precise endpoints, and real proof."
+---
+
+import { Aside, Card } from '@astrojs/starlight/components';
+
+An **instance spec** is the input document you supply when launching an instance. It
+describes the feature to build in a way that an autonomous resolver can execute and
+that a reality check can validate. Vague specs produce vague implementations. Precise
+specs converge fast.
+
+The platform validates that your spec matches the resolver's A2UI schema. This guide
+tells you how to write a spec that actually gets implemented correctly.
+
+<Aside type="danger" title="The cardinal rule">
+Specify **observable behavior** — what HTTP calls return, what status codes mean,
+what response shapes look like. Do NOT specify implementation details (data
+structures, algorithms, frameworks). The resolver picks the implementation. You
+describe the contract.
+</Aside>
+
+---
+
+## Core principle: verifiable behavior only
+
+The platform proves correctness through HTTP calls against live services. Everything
+in your spec must be expressible as an observable test.
+
+```
+✅ DO: Specify observable outcomes
+   POST /api/items returns 201 with the created item including a generated ID
+
+✅ DO: Define measurable criteria
+   Response time under 200ms for GET /api/health
+
+❌ DON'T: Prescribe implementation
+   Use a HashMap for O(1) item lookup
+
+❌ DON'T: Use vague goals
+   Make the API reliable and fast
+```
+
+---
+
+## Required spec structure
+
+Every spec must have six sections, in this order:
+
+### 1. Feature Intent — one sentence, starts with a verb
+
+```markdown
+Add comment support to the existing issues API.
+```
+
+```
+✅ Starts with a verb
+✅ One sentence
+✅ Cohesive feature
+
+❌ "This feature will add commenting functionality. Users want to be able to
+    comment on issues. We should also consider moderation features for the future."
+```
+
+### 2. Endpoints — complete request/response shapes
+
+For every endpoint, specify: method + exact path, request body with example JSON,
+success response with status code and example JSON.
+
+```markdown
+### Create Comment
+`POST /repos/{owner}/{repo}/issues/{issue_number}/comments`
+
+Creates a comment on an issue.
+
+**Request body:**
+```json
+{
+  "body": "This looks like a duplicate of #3"
+}
+```
+
+**Success response (201 Created):**
+```json
+{
+  "id": 1,
+  "body": "This looks like a duplicate of #3",
+  "user": "current-user",
+  "created_at": "2026-01-15T10:30:00Z"
+}
+```
+```
+
+```
+❌ "Add an endpoint to create comments. It should return the comment."
+```
+
+### 3. Validation Rules — exact constraints
+
+```markdown
+- Comment body MUST be 1–10,000 characters
+- Comment body MUST be non-empty after trimming whitespace
+- Issue number MUST exist in the repository
+```
+
+```
+❌ "Validate the input appropriately"
+❌ "Make sure comments aren't too long"
+```
+
+### 4. Error Cases — exact status codes and triggers
+
+```markdown
+- 400 for comment body exceeding 10,000 characters
+- 400 for empty body after trimming whitespace
+- 404 for non-existent issue number
+- 403 for unauthorized user
+```
+
+```
+❌ "Handle errors properly"
+❌ "Return appropriate status codes"
+```
+
+### 5. Integration Requirements — existing patterns to follow
+
+```markdown
+- Follow the existing bearer token auth middleware pattern in this codebase
+- Use the same storage-provider pattern as the issues endpoints
+- Comment IDs MUST be auto-incrementing integers per issue (not global)
+```
+
+```
+❌ "Integrate with the existing system"
+❌ "Follow established patterns"
+```
+
+### 6. Proof — observable outcomes that prove correctness
+
+```markdown
+## Proof
+- `POST /repos/{owner}/{repo}/issues/{issue_number}/comments` returns 201 with
+  a comment object containing `id`, `body`, `user`, `created_at`
+- `GET /repos/{owner}/{repo}/issues/{issue_number}/comments` returns the created
+  comment in the list
+- Submitting a body exceeding 10,000 characters returns 400
+- Submitting to a non-existent issue number returns 404
+```
+
+```
+❌ "Run the tests and make sure they pass"
+❌ "Check that the code looks correct"
+```
+
+<Aside type="tip" title="Proof is about observing, not doing">
+Each proof item should be a specific, verifiable behavior — an endpoint response,
+a measurable outcome. If you can't express the proof as observable behavior, the
+requirement is too vague.
+</Aside>
+
+---
+
+## Spec template
+
+Copy and fill this out:
+
+```markdown
+# [Feature Name]
+
+[One sentence starting with a verb]
+
+## Endpoints
+
+### [Endpoint Name]
+`[METHOD] [/exact/path/with/{parameters}]`
+
+[Brief description]
+
+**Request body:**
+```json
+{
+  "field": "example_value"
+}
+```
+
+**Success response ([status code]):**
+```json
+{
+  "id": 1,
+  "field": "example_value",
+  "created_at": "2026-01-15T10:30:00Z"
+}
+```
+
+## Validation Rules
+- Field MUST be [exact constraint]
+- Parameter MUST [specific requirement]
+
+## Error Cases
+- [status] for [specific condition]
+- [status] for [specific condition]
+
+## Integration Requirements
+- Follow the [specific pattern] for authentication
+- Use the [specific pattern] for storage
+- [Relationship to existing data]
+
+## Proof
+- [Endpoint] returns [status] with [specific response shape]
+- [Condition] produces [expected behavior]
+- [Edge case] returns [expected error]
+```
+
+---
+
+## Anti-pattern table
+
+| ❌ Anti-pattern | Why it fails | ✅ Fix |
+|-----------------|-------------|--------|
+| "Add a user system" | Scope too broad | "Add `POST /users` endpoint with email/password" |
+| "Returns user data" | Response shape undefined | "Returns 200 with `{\"id\": 1, \"email\": \"user@example.com\"}`" |
+| "Validate appropriately" | Validation undefined | "Email MUST match RFC 5322 format" |
+| "Handle auth" | Auth pattern unspecified | "Follow existing bearer token middleware pattern" |
+| "Store in database" | Storage pattern unspecified | "Use existing User storage-provider pattern" |
+| "Return error if invalid" | Error handling vague | "Return 400 for malformed email format" |
+| "Also add rate limiting" | Scope creep | Separate spec |
+| "Make it performant" | No measurable criterion | "Response time under 200ms for `GET /api/health`" |
+
+---
+
+## Scope guidelines
+
+**Appropriate scope:**
+
+```markdown
+# Single endpoint
+Add GET /api/health/ready returning 200 with {"ready": true} when initialized,
+503 with {"ready": false} during startup.
+
+# Feature (3-5 related endpoints)
+Full CRUD for a single resource: POST (create), GET (read), PUT (update),
+DELETE (delete) with consistent response shapes.
+
+# Enhanced search
+Add GET /repos/{owner}/{repo}/issues/search with: q (text), state (open/closed),
+labels (comma-separated), sort (created/updated), order (asc/desc).
+Return paginated results with has_next_page field.
+```
+
+**Too broad — split into separate specs:**
+
+```markdown
+❌ "Add user authentication, file uploads, and email notifications"
+❌ "Refactor the entire API to use microservices with GraphQL"
+❌ "Add commenting, reactions, and notifications to the issues system"
+```
+
+---
+
+## Execution time expectations
+
+| Spec complexity | Approximate time | Notes |
+|-----------------|-----------------|-------|
+| Simple (1-2 endpoints) | ~13 minutes | 2–3 convergence cycles |
+| Medium (3-5 endpoints) | ~25 minutes | 4–6 convergence cycles |
+| Complex (6+ endpoints) | ~40 minutes | 6–10 convergence cycles |
+
+Factors that increase duration: complex validation rules, cross-endpoint integration
+requirements, comprehensive error handling, first run (image download + caching).
+
+**Tips for faster convergence:**
+- Reference existing patterns explicitly ("Follow the user auth pattern" not "add auth")
+- Provide complete JSON examples — partial examples cause guesswork cycles
+- Define error cases precisely — "400 for invalid email format" vs "handle errors"
+- One cohesive feature per spec — multi-feature specs require more back-and-forth
+
+---
+
+## Launching an instance with a spec
+
+```bash
+# Read your spec file
+SPEC=$(cat my-feature-spec.md)
+
+# Create the instance
+curl -X POST "$RESOLVE_URL/api/instances" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"resolver\": \"understudy\",
+    \"input\": {
+      \"spec\": $(echo "$SPEC" | jq -Rs .),
+      \"repo\": \"myorg/myrepo\",
+      \"pipeline\": \"standard\"
+    }
+  }"
+```
+
+Or use the platform UI at the base URL — `GET /` opens the instance creation form.
+
+---
+
+## Quality checklist
+
+Before submitting, verify each item is TRUE:
+
+**Observable behavior:**
+- [ ] Every requirement is testable via HTTP request/response
+- [ ] All success responses include complete example JSON
+- [ ] All error cases specify exact HTTP status codes
+- [ ] No implementation details (data structures, algorithms) are prescribed
+
+**Completeness:**
+- [ ] All endpoints specify HTTP method and exact path
+- [ ] All request bodies have complete JSON examples
+- [ ] All validation rules specify exact limits/formats
+- [ ] All error conditions have specific trigger conditions
+
+**Scope:**
+- [ ] Spec describes exactly one cohesive feature
+- [ ] No unrelated changes bundled together
+- [ ] Feature integrates with existing system patterns
+- [ ] No future enhancements included
+
+**Specificity:**
+- [ ] Example JSON uses realistic field names and values
+- [ ] Status codes are exact (201, not "2xx")
+- [ ] Character limits are precise numbers (not "reasonable")
+- [ ] Auth/storage patterns reference specific existing patterns

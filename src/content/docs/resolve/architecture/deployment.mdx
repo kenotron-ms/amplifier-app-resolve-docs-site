@@ -1,0 +1,306 @@
+---
+title: "Deployment (Single VM)"
+description: "How Amplifier Resolve is deployed on a single Azure VM — systemd services, networking, environment configuration, and operations."
+---
+
+import { Aside, Card } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+
+The production Resolve deployment runs on a single **Standard_D8s_v5** Azure VM
+(8 vCPUs, 32 GiB RAM). The backend, frontend, Incus container runtime, and all
+worker containers live on this one host. This document describes how the stack is
+wired together and how to operate it.
+
+---
+
+## Stack overview
+
+<Mermaid code={`
+flowchart TD
+    Internet(["🌐 Internet"])
+
+    subgraph VM ["☁️ Azure VM — Standard_D8s_v5 (8 vCPU · 32 GiB RAM)"]
+        Caddy["🔀 Caddy\nreverse proxy · TLS · :443"]
+
+        subgraph SVC ["systemd services"]
+            Backend["amplifier-resolve serve\n:10120 loopback only"]
+            Frontend["React SPA\nbuilt static files"]
+        end
+
+        subgraph Incus ["📦 Incus container runtime"]
+            W["resolve-{id}\nworker containers"]
+            G["resolve-{id}-gitea\nGitea sidecars"]
+            RC["resolve-{id}-env-{uuid}\nRC runners (optional)"]
+        end
+    end
+
+    AZ[("☁️ Azure Files NFS\\n/workspace\\nsurvives VM restarts")]
+
+    Internet --> Caddy
+    Caddy -->|"resolve.amplifier.ms → :10120"| Backend
+    Caddy --> Frontend
+    Backend -->|manage| W
+    Backend -->|manage| G
+    Backend -->|spawn| RC
+    Backend <-->|persistent state| AZ
+`} caption="Production stack — one VM, Caddy at the edge, all containers on Incus" />
+
+---
+
+## Service topology
+
+The stack runs as **systemd units**. All services are managed via `systemctl`.
+
+| Service | Command | Port | Notes |
+|---------|---------|------|-------|
+| `amplifier-resolve-backend.service` | `amplifier-resolve serve` | `:10120` (loopback) | FastAPI backend |
+| `amplifier-resolve-frontend.service` | Node/Caddy static serve | `:3000` (or via Caddy) | React SPA build output |
+| `caddy.service` | Caddy reverse proxy | `:443`, `:80` | TLS termination + routing |
+| `incus.service` | Incus container runtime | — | Must be running for worker containers |
+
+```bash
+# Check all service status
+systemctl status amplifier-resolve-backend
+systemctl status caddy
+systemctl status incus
+
+# Restart backend
+systemctl restart amplifier-resolve-backend
+
+# Follow backend logs
+journalctl -u amplifier-resolve-backend -f
+
+# Follow Caddy logs
+journalctl -u caddy -f
+```
+
+---
+
+## Environment configuration
+
+The backend reads its environment from `/root/.amplifier/resolve/env`. This file is
+the canonical source for feature flags, API keys, and infrastructure settings.
+
+```bash
+# View current env
+cat /root/.amplifier/resolve/env
+
+# Edit (then restart backend to apply)
+nano /root/.amplifier/resolve/env
+systemctl restart amplifier-resolve-backend
+```
+
+### Key environment variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `AMPLIFIER_RESOLVE_ENABLE_REALITY_CHECK` | For RC | `true` to enable reality check capability |
+| `AMPLIFIER_RESOLVE_REALITY_CHECK_RUNNER_IMAGE` | For RC | Incus image name for RC runner |
+| `AMPLIFIER_RESOLVE_DATA_DIR` | No | Override data root (default: `~/.amplifier/resolve/`) |
+| `ANTHROPIC_API_KEY` | Yes (for LLM) | Primary LLM provider |
+| `OPENAI_API_KEY` | Alt | Alternative LLM provider |
+| `GH_TOKEN` | Yes | GitHub access for workspace repos + PR creation |
+
+---
+
+## Auth token
+
+Bearer token is auto-generated at first startup and stored at:
+
+```
+~/.amplifier/resolve/token
+```
+
+```bash
+# Get your token
+cat ~/.amplifier/resolve/token
+
+# Verify it works
+curl -H "Authorization: Bearer $(cat ~/.amplifier/resolve/token)" \
+  http://localhost:10120/api/health
+```
+
+---
+
+## Disk management
+
+<Aside type="danger" title="OS disk is 30 GiB — watch it">
+The OS disk has 30 GiB. Accumulated container logs, build artifacts, and old Incus
+images can fill it. Instance data lives on the Azure Files NFS mount and is safe,
+but the OS disk filling to 100% will take down the backend.
+</Aside>
+
+### Data locations
+
+| Path | Content | Disk |
+|------|---------|------|
+| `~/.amplifier/resolve/instances/` | Instance event logs, state, artifacts | OS disk |
+| `~/.amplifier/resolve/token` | Auth token | OS disk |
+| `/workspace/` | Azure Files NFS mount — application state | Azure Files |
+| `/var/lib/incus/` | Incus container storage | OS disk |
+| `/var/log/` | System logs | OS disk |
+
+### Reclaim space
+
+```bash
+# Check disk usage
+df -h /
+
+# Find large directories
+du -sh ~/.amplifier/resolve/instances/* | sort -rh | head -20
+
+# Remove completed instance data (older than 7 days)
+find ~/.amplifier/resolve/instances/ -maxdepth 1 -type d -mtime +7 \
+  -exec rm -rf {} +
+
+# Clean Incus images (removes unused images)
+incus image list
+incus image delete <fingerprint>
+
+# Clean stopped containers
+incus list
+incus delete resolve-{id}  # for completed/stuck instances
+
+# Check journal disk usage
+journalctl --disk-usage
+# Vacuum to last 7 days
+journalctl --vacuum-time=7d
+```
+
+---
+
+## Incus operations
+
+```bash
+# List all containers (running + stopped)
+incus list
+
+# Check container resource usage
+incus info resolve-{id}
+
+# Connect to a running worker container
+incus exec resolve-{id} -- /bin/bash
+
+# Read instance events directly
+incus exec resolve-{id} -- tail -f /project/.resolve/events.jsonl
+
+# Stop a stuck container
+incus stop resolve-{id} --force
+incus delete resolve-{id}
+```
+
+---
+
+## DNS and TLS
+
+`resolve.amplifier.ms` CNAME points to the VM's public IP. Caddy handles TLS via
+Let's Encrypt ACME automatically.
+
+```bash
+# Check Caddy's TLS cert status
+caddy validate --config /etc/caddy/Caddyfile
+curl -I https://resolve.amplifier.ms/api/health
+```
+
+---
+
+## Worker cache image
+
+The cache image (`amplifier-cache:python`) reduces worker startup from ~5 minutes to
+~15 seconds by pre-baking common Python dependencies into an Incus image.
+
+```bash
+# Build the cache image (run once, or after major dependency changes)
+cd ~/amplifier-resolve
+bash scripts/build-cache-image.sh
+
+# Verify image exists
+incus image list | grep amplifier-cache
+
+# If cache image is missing, workers use cold path (~5 min startup)
+```
+
+---
+
+## Updating the platform
+
+```bash
+# Pull latest backend
+cd ~/amplifier-resolve
+git pull
+
+# Restart backend (picks up new code)
+systemctl restart amplifier-resolve-backend
+
+# Pull and rebuild frontend
+cd ~/amplifier-app-resolve
+git pull
+npm install
+npm run build
+
+# Check status
+systemctl status amplifier-resolve-backend
+curl https://resolve.amplifier.ms/api/health
+```
+
+---
+
+## Operational health checks
+
+```bash
+#!/usr/bin/env bash
+# Quick health check script
+
+BASE="https://resolve.amplifier.ms"
+TOKEN=$(cat /root/.amplifier/resolve/token)
+
+echo "=== Service Status ==="
+systemctl is-active amplifier-resolve-backend caddy incus
+
+echo ""
+echo "=== API Health ==="
+curl -s "$BASE/api/health" | jq .
+
+echo ""
+echo "=== Auth Status ==="
+curl -s "$BASE/api/auth/status" | jq .
+
+echo ""
+echo "=== Active Instances ==="
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/api/instances?status=running" | jq 'length'
+
+echo ""
+echo "=== Disk Usage ==="
+df -h / | tail -1
+
+echo ""
+echo "=== Container Count ==="
+incus list --format csv | wc -l
+```
+
+---
+
+## Logs and debugging
+
+```bash
+# Backend logs (last 100 lines)
+journalctl -u amplifier-resolve-backend -n 100
+
+# Backend logs with timestamps, follow
+journalctl -u amplifier-resolve-backend -f --output=short-iso
+
+# Look for errors in last hour
+journalctl -u amplifier-resolve-backend --since "1 hour ago" | grep -i error
+
+# Caddy access logs
+journalctl -u caddy -f
+
+# Instance-specific events (bypass API)
+tail -f ~/.amplifier/resolve/instances/{instance_id}/events/events.jsonl | jq .
+```
+
+<Aside type="tip" title="Azure Files is the safety net">
+Instance data written to `/workspace` (the Azure Files NFS mount) survives VM
+restarts and OS disk issues. If the VM needs to be rebuilt or the OS disk fails,
+instance history is recoverable from Azure Files.
+</Aside>

@@ -1,0 +1,214 @@
+---
+title: "Auth Model"
+description: "How to authenticate to the Resolve API — bearer tokens, the token file, SSE auth, and public paths."
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Resolve uses a single auth model: a **shared-secret Bearer token** stored at
+`~/.amplifier/resolve/token`. Auth is disabled by default on localhost and
+auto-enabled when the server binds to `0.0.0.0`.
+
+---
+
+## Behavior by binding
+
+| Binding | Auth | Token |
+|---------|------|-------|
+| `--host localhost` (default) | **Disabled** — no token needed | — |
+| `--host 0.0.0.0` | **Auto-enabled** | Generated at `~/.amplifier/resolve/token` |
+
+When auth is enabled, a cryptographically random token is generated on first startup
+and written to `~/.amplifier/resolve/token` with permissions `0o600`.
+
+---
+
+## Get your token
+
+```bash
+# Read the token directly
+cat ~/.amplifier/resolve/token
+
+# Or via CLI
+amplifier-resolve show-token
+
+# Export for use in scripts
+export TOKEN=$(cat ~/.amplifier/resolve/token)
+```
+
+---
+
+## Sending the token
+
+### API calls — Authorization header
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" "$RESOLVE_URL/api/instances"
+```
+
+### SSE / EventSource — query parameter
+
+`EventSource` connections in browsers cannot set custom headers. Use the `?token=`
+query parameter instead:
+
+```bash
+# curl
+curl -N "$RESOLVE_URL/api/instances/$ID/events?token=$TOKEN"
+```
+
+```javascript
+// Browser EventSource
+const es = new EventSource(
+  `${RESOLVE_URL}/api/instances/${id}/events?token=${encodeURIComponent(token)}`
+);
+```
+
+<Aside type="caution" title="SSE token in query param">
+The `?token=` parameter appears in server access logs. On the production VM, Caddy
+handles TLS termination — make sure logs are appropriately protected and the
+connection uses HTTPS so the token isn't visible in transit.
+</Aside>
+
+---
+
+## Check auth status
+
+Before making API calls, verify whether auth is required:
+
+```bash
+curl "$RESOLVE_URL/api/auth/status"
+# {"required": false}   — auth disabled, no token needed
+# {"required": true}    — auth required, send Bearer token
+```
+
+## Verify your token
+
+```bash
+curl -X POST "$RESOLVE_URL/api/auth/verify" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "your-token-here"}'
+# {"valid": true}
+# {"valid": false}
+```
+
+---
+
+## Public paths — no token required
+
+These paths bypass authentication regardless of configuration:
+
+```
+GET  /api/health          health check
+GET  /api/auth/status     check whether auth is required
+POST /api/auth/verify     verify a token
+GET  .../viewport.js      viewport ESM bundles (loaded by browser before auth)
+GET  /docs                FastAPI Swagger UI
+GET  /openapi.json        OpenAPI spec
+GET  /redoc               ReDoc UI
+```
+
+---
+
+## Making authenticated API calls
+
+### Shell script pattern
+
+```bash
+#!/usr/bin/env bash
+RESOLVE_URL="http://resolve.amplifier.ms"
+TOKEN=$(cat ~/.amplifier/resolve/token)
+
+# Create an instance
+INSTANCE_ID=$(curl -s -X POST "$RESOLVE_URL/api/instances" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"resolver": "understudy", "input": {"spec": "Add GET /ping", "repo": "myorg/myrepo"}}' \
+  | jq -r '.instance_id')
+
+echo "Instance: $INSTANCE_ID"
+
+# Stream events (query param for SSE)
+curl -N "$RESOLVE_URL/api/instances/$INSTANCE_ID/events?token=$TOKEN"
+```
+
+### Python client
+
+```python
+import os, json, requests
+from pathlib import Path
+
+class ResolveClient:
+    def __init__(self, base_url: str, token: str | None = None):
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()
+        if token:
+            self.session.headers["Authorization"] = f"Bearer {token}"
+
+    @classmethod
+    def from_env(cls) -> "ResolveClient":
+        """Auto-configure from environment or token file."""
+        base_url = os.environ.get("RESOLVE_URL", "http://localhost:10120")
+        token = os.environ.get("RESOLVE_TOKEN")
+        if not token:
+            token_path = Path.home() / ".amplifier" / "resolve" / "token"
+            if token_path.exists():
+                token = token_path.read_text().strip()
+
+        client = cls(base_url, token)
+
+        # Check if auth is actually required — drop token if not
+        status = client.get("/api/auth/status").json()
+        if not status.get("required"):
+            client.session.headers.pop("Authorization", None)
+
+        return client
+
+    def get(self, path: str, **kwargs):
+        return self.session.get(f"{self.base_url}{path}", **kwargs)
+
+    def post(self, path: str, **kwargs):
+        return self.session.post(f"{self.base_url}{path}", **kwargs)
+
+    def stream_events(self, instance_id: str):
+        """Stream SSE events. Uses ?token= since EventSource can't set headers."""
+        token = self.session.headers.get("Authorization", "").removeprefix("Bearer ")
+        url = f"{self.base_url}/api/instances/{instance_id}/events"
+        if token:
+            url += f"?token={token}"
+        with self.session.get(url, stream=True) as resp:
+            for line in resp.iter_lines():
+                if line:
+                    text = line.decode()
+                    if text.startswith("data: "):
+                        event = json.loads(text[6:])
+                        yield event
+                        if event.get("type") == "done":
+                            break
+
+# Usage
+client = ResolveClient.from_env()
+resp = client.post("/api/instances", json={"resolver": "understudy", "input": {...}})
+instance_id = resp.json()["instance_id"]
+for event in client.stream_events(instance_id):
+    print(event["event_type"])
+```
+
+---
+
+## Auth error responses
+
+| Code | Body | When |
+|------|------|------|
+| `401` | `{"detail": "Unauthorized"}` | Token missing, invalid, or rejected |
+
+---
+
+## Security properties
+
+| Property | Detail |
+|----------|--------|
+| **Token generation** | `secrets.token_urlsafe(32)` — 256 bits of entropy |
+| **Token comparison** | `hmac.compare_digest()` — constant-time, immune to timing attacks |
+| **Token storage** | `~/.amplifier/resolve/token`, mode `0o600` (owner read-only) |
+| **SSE transport** | `?token=` query param — use HTTPS in production to prevent interception |
+| **Viewport bundles** | `*.../viewport.js` is public — viewport JS must be safe to serve unauthenticated |

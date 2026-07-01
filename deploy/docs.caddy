@@ -1,0 +1,9 @@
+# docs.ampbox.io — Amplifier docs (PRIVATE to Ken).
+# Copy to /mnt/services/docs.caddy and reload the edge Caddy.
+# Thin reverse_proxy (same shape as wiki.caddy/muxterm.caddy). Upstream is
+# oauth2-proxy (:4182), which enforces GitHub OAuth (kenotron-ms only) and
+# shares the .ampbox.io SSO cookie, then proxies to the static docs (:8092).
+# Do NOT point this straight at :8092 — that would be PUBLIC.
+docs.ampbox.io {
+	reverse_proxy http://127.0.0.1:4182
+}

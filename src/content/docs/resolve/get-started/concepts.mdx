@@ -1,0 +1,266 @@
+---
+title: "Core Concepts"
+description: "Instances, resolvers, events, viewports, pipelines, and reality checks — the mental model for Resolve."
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+
+Resolve is built on six interlocking primitives. Learn these and every other page in
+the docs clicks into place.
+
+<Mermaid code={`
+flowchart TD
+    Consumer(["👤 Consumer\ncurl · Python · Browser · Agent"])
+
+    subgraph Backend ["🖥  Resolve Backend (FastAPI)"]
+        direction LR
+        Registry["ManifestRegistry"] --> Orchestrator["Orchestrator"]
+        Monitor["Monitor\npoll loop"] --> EventBus["EventBus\nSSE fan-out"]
+    end
+
+    subgraph Worker ["📦 Worker Container — Incus"]
+        direction LR
+        Resolver["⚙️ Resolver Process\nJSON-RPC · stdio"] --> Files[("events.jsonl\nstate.json")]
+        Resolver --> Data["/project/.resolve/data/"]
+    end
+
+    Consumer -->|"POST /instances\n{resolver, input}"| Backend
+    Orchestrator -->|spawn + setup| Worker
+    Files -->|poll| Monitor
+    EventBus -->|"SSE /events"| Consumer
+    Consumer -->|"GET /data/{path}"| Data
+`} caption="The six moving parts — consumer drives the platform, resolver does the work, events flow back" />
+
+---
+
+## 1. Instance
+
+An **instance** is the unit of work in Resolve. It represents a single run of a
+resolver against a specific input. Every instance has:
+
+- A unique 12-character hex `instance_id`
+- A `resolver` — which resolver handles it
+- An `input` — the resolver-specific parameters
+- A `status` — where it is in its lifecycle
+- An SSE event stream — live progress
+
+You create instances with `POST /instances` and watch them with
+`GET /instances/{id}/events`. An instance is the thing you create, monitor,
+pause, resume, and cancel.
+
+**Status lifecycle:**
+
+<Mermaid code={`
+flowchart LR
+    created --> starting --> running
+    running --> completed
+    running --> failed
+    running <--> awaiting_input
+    running <--> paused
+    running --> cancelled
+    starting --> failed
+    awaiting_input --> cancelled
+    paused --> cancelled
+
+    style completed fill:#15803d,color:#fff,stroke:#166534
+    style failed    fill:#b91c1c,color:#fff,stroke:#991b1b
+    style cancelled fill:#6b7280,color:#fff,stroke:#4b5563
+    style running   fill:#1d4ed8,color:#fff,stroke:#1e40af
+    style awaiting_input fill:#d97706,color:#fff,stroke:#b45309
+    style paused    fill:#7c3aed,color:#fff,stroke:#6d28d9
+    style created   fill:#0891b2,color:#fff,stroke:#0e7490
+    style starting  fill:#0891b2,color:#fff,stroke:#0e7490
+`} caption="Happy path: created → starting → running → completed" />
+
+---
+
+## 2. Resolver
+
+A **resolver** is a pluggable strategy — the thing that actually does the work
+inside an instance. It runs as a **separate process** (not in-process code)
+inside an isolated worker container, communicating with the platform over
+JSON-RPC on stdio via the `amplifier-resolver-sdk`.
+
+Every resolver must provide two things:
+
+| Requirement | Purpose |
+|-------------|---------|
+| `manifest.json` | Tells the platform how to launch, register, and configure the resolver |
+| `run()` implementation | The code that executes the task and emits events |
+
+Resolvers are **registered** via `amplifier-resolve resolver add`, not discovered
+automatically. The platform catalog at `~/.amplifier/resolve/resolvers.json` is the
+single source of truth. Discover available resolvers at `GET /resolvers`.
+
+<Aside type="tip" title="Resolver vs Instance">
+A **resolver** is a strategy (registered once, reused many times).
+An **instance** is a single run of that strategy against specific input.
+Think of a resolver as a program and an instance as a process.
+</Aside>
+
+### The SDK
+
+The `amplifier-resolver-sdk` is the base class library for writing resolvers. It
+handles the stdio JSON-RPC transport, event emission, state management, and input
+requests — you write `run()`, the SDK does the rest.
+
+```python
+from amplifier_resolver_sdk import Resolver, ResolverResult
+
+class MyResolver(Resolver):
+    async def run(self, instance) -> ResolverResult:
+        await self.emit("resolver:phase", {"name": "working"})
+        # ... do work ...
+        await self.emit("resolver:artifact", {"kind": "summary", "value": "done"})
+        return ResolverResult(status="completed", summary="done")
+
+if __name__ == "__main__":
+    MyResolver().serve()
+```
+
+---
+
+## 3. Events
+
+Every instance produces a live **event stream** — an append-only JSONL log of
+everything that happens. Events are the primary observability surface.
+
+```
+data: {"schema_version":1,"event_type":"resolve.worker.ready","instance_id":"abc123",...}
+
+data: {"schema_version":1,"event_type":"resolver:phase","data":{"name":"planning"},...}
+
+data: {"schema_version":1,"event_type":"resolver:artifact","data":{"kind":"pr","value":"https://..."},...}
+
+data: {"schema_version":1,"event_type":"resolver:completed","data":{"outcome":"success"},...}
+
+data: {"type":"done"}
+```
+
+Stream events with `curl -N $RESOLVE_URL/api/instances/{id}/events` or the SSE
+endpoint. Events close with `{"type": "done"}` when the instance reaches a terminal
+status.
+
+**Three tiers of events — by contract stability:**
+
+| Tier | Prefix | Emitter | Stability |
+|------|--------|---------|-----------|
+| 1 | `resolve.*` | Platform host | **Stable** — guaranteed across releases |
+| 2 | `resolver.*` | SDK infrastructure | Cross-resolver vocabulary (see [Event Vocabulary](/resolve/build/events/)) |
+| 3 | `{resolver_name}.*` | Resolver-specific | Per-resolver; may change |
+
+Alongside `events.jsonl`, each instance maintains a `state.json` — a point-in-time
+snapshot of current status and phase, overwritten atomically on each update. Use
+`GET /instances/{id}/state` for "where is it right now?" without parsing the full
+event stream.
+
+---
+
+## 4. Viewport
+
+A **viewport** is the custom UI that renders alongside an instance in the React
+frontend. Each resolver can optionally ship a viewport — an ESM JavaScript bundle
+that the frontend loads dynamically and mounts into a panel.
+
+Viewports receive a `ViewportProps` object with:
+- `instanceId` — the instance they render
+- `fetchData(path)` — fetches files from the resolver's data directory
+- `onEvent(handler)` — subscribes to the instance's SSE event stream
+
+A resolver without a viewport gets the generic platform UI (event log, state, input
+forms). A resolver with a viewport gets full control over its visual representation.
+
+```
+manifest.json:
+{
+  "viewport_bundle": "git+https://github.com/myorg/my-viewport@main",
+  "viewport_path": "dist/viewport.js"
+}
+```
+
+---
+
+## 5. Pipelines (DOT format)
+
+A **pipeline** is a directed graph of agent work, written in DOT format, that
+orchestrates multi-step resolver workflows. The `dot-graph` resolver reads pipeline
+files and executes each node as an Amplifier session, passing outputs between nodes.
+
+```dot
+digraph my_pipeline {
+  rankdir=LR;
+
+  Plan [label="Plan\nthe work" session="@bundle:plan-prompt"];
+  Implement [label="Implement" session="@bundle:implement-prompt"];
+  Verify [label="Verify\nresult" session="@bundle:verify-prompt"];
+
+  Plan -> Implement -> Verify;
+}
+```
+
+Pipelines are the primary way to express multi-phase autonomous workflows in Resolve.
+They live in the resolver's working directory and are selected via the instance input.
+
+---
+
+## 6. Reality Check
+
+A **reality check** is how Resolve proves that generated software actually works.
+Given a repository and plain-language **acceptance criteria**, the platform:
+
+1. Spawns an isolated clean-room container
+2. Deploys the software into it
+3. Runs validators against the criteria
+4. Returns a **verdict**: `pass`, `fail`, or a `failure_mode` (infrastructure error)
+
+Reality checks are invoked from within a resolver's `run()` via the SDK:
+
+```python
+handle = await self.start_reality_check(
+    software_path="https://github.com/example/app",
+    acceptance_criteria="GET / returns 200 with body containing 'Hello'",
+)
+result = await self.wait_for_reality_check(handle)
+# result.verdict in {"pass", "fail"} — or None with result.failure_mode set
+```
+
+<Aside type="note" title="Feature flag required">
+Reality check requires `AMPLIFIER_RESOLVE_ENABLE_REALITY_CHECK=true` on the backend.
+The endpoint returns HTTP 501 without it.
+</Aside>
+
+---
+
+## How they fit together
+
+<CardGrid>
+  <Card title="Instance" icon="star">
+    The unit of work. You create one, watch its events, and read its final state.
+  </Card>
+  <Card title="Resolver" icon="puzzle">
+    The strategy. Registered once, runs inside isolated containers, emits events.
+  </Card>
+  <Card title="Events" icon="list-format">
+    The observability layer. Append-only JSONL — the primary interface between
+    the resolver and the outside world.
+  </Card>
+  <Card title="Viewport" icon="laptop">
+    The custom UI. An ESM bundle the resolver optionally ships for a rich frontend
+    experience.
+  </Card>
+  <Card title="Pipeline" icon="forward-slash">
+    The workflow graph. DOT format, executed by the `dot-graph` resolver to
+    orchestrate multi-step agent work.
+  </Card>
+  <Card title="Reality Check" icon="approve-check">
+    The verification layer. Clean-room deploy + validator = a real pass/fail verdict.
+  </Card>
+</CardGrid>
+
+## Next steps
+
+- Build your first resolver: [Your First Resolver](/resolve/get-started/first-resolver/)
+- Understand the Resolver Protocol: [Resolver Protocol](/resolve/build/resolver-protocol/)
+- Learn the full API: [REST API Reference](/resolve/use/api/)
+- Understand how instances move through their lifecycle: [Instance Lifecycle](/resolve/architecture/lifecycle/)

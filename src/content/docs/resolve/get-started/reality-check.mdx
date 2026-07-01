@@ -1,0 +1,93 @@
+---
+title: "Golden Path: Run a Reality Check"
+description: "Verify that generated software actually meets your acceptance criteria — a clean-room deploy plus validators that return a real pass/fail verdict."
+---
+
+import { Steps, Aside, Card } from '@astrojs/starlight/components';
+
+A **reality check** is how Resolve proves that software actually works, rather
+than assuming it does. Given a repository and plain-language **acceptance
+criteria**, the platform spins up an isolated clean-room, deploys the software,
+runs validators against your criteria, and returns a real **verdict** —
+`pass`, `fail`, or a `failure_mode` that explains why it couldn't decide.
+
+<Aside type="note" title="This lives inside a resolver">
+A reality check is a capability a resolver invokes from within its `run()`. It's
+easiest to understand after you've done the
+[first-resolver golden path](/resolve/get-started/first-resolver/), which
+establishes the resolver process and `run()` model this builds on.
+</Aside>
+
+## Why it matters
+
+The verdict **discriminates**. If the software genuinely meets the criteria you
+get `pass`; if it doesn't, you get `fail` with `failure_mode: software`. It is
+not a rubber stamp — a reality check that always passed would be worthless. The
+platform reports `failure_mode: infrastructure` when it couldn't run the check at
+all, so you can tell "the software failed" apart from "the check failed."
+
+## Prerequisites
+
+<Steps>
+
+1. **The feature flag is on.** The backend must run with
+   `AMPLIFIER_RESOLVE_ENABLE_REALITY_CHECK=true`.
+
+2. **The runner image is built.** The reality-check clean-room runs from a
+   prebuilt Incus image on the host.
+
+3. **An LLM provider credential** is present in the backend environment — the
+   validators use it, and it is forwarded into the runner.
+
+</Steps>
+
+## Invoke it from a resolver
+
+Inside your resolver's `run()`, start a reality check and wait for the verdict:
+
+```python
+async def run(self, instance) -> ResolverResult:
+    handle = await self.start_reality_check(
+        software_path="https://github.com/Azure-Samples/python-docs-hello-world",
+        acceptance_criteria=(
+            "When the app is deployed and an HTTP GET is made to '/', the "
+            "response status is 200 and the body contains the text 'Hello World'."
+        ),
+    )
+
+    # Block until the clean-room deploy + validators finish.
+    result = await self.wait_for_reality_check(handle)
+
+    await self.emit("resolver:artifact", {
+        "kind": "reality_check",
+        "value": {"verdict": result.verdict, "failure_mode": result.failure_mode},
+    })
+    return ResolverResult(status="completed", summary=f"verdict={result.verdict}")
+```
+
+To surface live progress, stream the sub-check's events:
+
+```python
+async for event in self.reality_check_events(handle):
+    await self.emit("resolver:phase", {"name": f"reality_check:{event['type']}"})
+```
+
+## Interpreting the verdict
+
+<Card title="Verdict semantics" icon="approve-check">
+- **`verdict: "pass"`, `failure_mode: null`** — the software met the criteria.
+- **`verdict: "fail"`, `failure_mode: "software"`** — the software did **not**
+  meet the criteria. This is a real, discriminating negative.
+- **`verdict: null`, `failure_mode: "infrastructure"`** — the check could not be
+  run (setup, connectivity, or runner problem). Not a statement about the
+  software; fix the environment and re-run.
+</Card>
+
+A complete run also produces an HTML report you can link from your resolver's
+output for a human-readable breakdown of each criterion.
+
+## Next steps
+
+- Full API and configuration details: [Reality Check](/resolve/use/reality-check/).
+- Understand the clean-room isolation model: [Container & Data Model](/resolve/architecture/containers/).
+- Build the resolver that hosts this: [Your First Resolver](/resolve/get-started/first-resolver/).

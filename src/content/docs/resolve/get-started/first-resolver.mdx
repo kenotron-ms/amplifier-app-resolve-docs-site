@@ -1,0 +1,169 @@
+---
+title: "Golden Path: Your First Resolver"
+description: "From zero to a running custom resolver — manifest, protocol, events, registration, and your first instance."
+---
+
+import { Steps, Aside, Card } from '@astrojs/starlight/components';
+
+This is the fastest route to understanding Resolve end to end. By the end you'll
+have a custom **resolver** registered with a running backend, and you'll drive an
+**instance** through it while watching its **event stream** — touching the four
+contracts every other page assumes you know: the `manifest.json` schema, the
+event vocabulary, the registration mechanism, and the instance lifecycle.
+
+<Aside type="tip" title="Prefer to verify, not build?">
+If you want to see the platform prove that generated software *works* rather than
+author a resolver, jump to [Run a Reality Check](/resolve/get-started/reality-check/).
+That path is best understood *after* this one, though — it lives inside a resolver's
+`run()`.
+</Aside>
+
+## Prerequisites
+
+<Steps>
+
+1. **A running Resolve backend.** Either a local stack or the hosted platform.
+   You'll need its base URL and, if auth is enabled, a Bearer token.
+
+2. **An LLM provider credential** in the environment (for example
+   `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`), and `GH_TOKEN` for repo access.
+
+3. **A container runtime.** Locally, Resolve uses **Incus** for worker
+   containers — `incusd` must be running. (Docker is only used for a future
+   remote-deploy path, not local development.)
+
+</Steps>
+
+## What a resolver actually is
+
+A resolver is a **separate process**, not an in-process Python object. The
+platform launches it per the `command` in your `manifest.json` and drives it over
+**JSON-RPC on stdio**. You write your resolver against the
+`amplifier-resolver-sdk` base class; the SDK speaks the protocol for you.
+
+That means a resolver has exactly two things you must get right:
+
+1. A **`manifest.json`** that tells the platform how to launch and register it.
+2. A **`run()`** implementation that does the work and **emits the required
+   events** — ending with `resolver:completed`.
+
+## Step 1 — The manifest
+
+Create `manifest.json`. This is the registration contract — the platform
+validates it against a JSON Schema when you add the resolver.
+
+```json
+{
+  "name": "hello-world",
+  "version": "0.1.0",
+  "description": "A minimal resolver that greets and completes.",
+  "command": ["python", "-m", "hello_world_resolver"]
+}
+```
+
+<Aside type="caution" title="Required fields are strict">
+`name` (kebab-case), `version` (semver), `description`, and `command` are all
+required. If your resolver needs container setup steps, `container.command`
+becomes required too. See the full
+[manifest.json reference](/resolve/build/manifest/) for every field.
+</Aside>
+
+## Step 2 — The resolver
+
+Implement `run()`. The single most important rule in all of Resolve:
+
+<Aside type="danger" title="Always emit resolver:completed">
+Your resolver **must** emit a `resolver:completed` event on every exit path. Omit
+it and the platform will hang until a watchdog or process-exit fallback fires.
+The minimum event chain is: **`created → phase → artifact → completed`**.
+</Aside>
+
+```python
+# hello_world_resolver/__main__.py
+from amplifier_resolver_sdk import Resolver, ResolverResult
+
+class HelloWorldResolver(Resolver):
+    async def run(self, instance) -> ResolverResult:
+        # 1. Announce a phase of work.
+        await self.emit("resolver:phase", {"name": "greeting"})
+
+        # 2. Do the work and record an artifact.
+        message = f"Hello from {instance.spec.get('name', 'Resolve')}!"
+        await self.emit("resolver:artifact", {"kind": "summary", "value": message})
+
+        # 3. Complete. NEVER skip this.
+        return ResolverResult(status="completed", summary=message)
+
+if __name__ == "__main__":
+    HelloWorldResolver().serve()
+```
+
+<Aside type="note" title="State: overwrite vs merge">
+When you write instance state, know the difference: `update_state()` **overwrites**
+`state.json` entirely, while `merge_state()` does a read-modify-write. Sending a
+partial update through `update_state()` silently drops previously written fields —
+a common early bug.
+</Aside>
+
+## Step 3 — Register it
+
+Resolvers are **not** discovered via Python entry points. You register them
+explicitly with the CLI, which clones (or reads a local path), validates the
+manifest, optionally fetches the viewport bundle, and writes the resolver into
+the backend's `resolvers.json` catalog. The backend live-reloads — no restart.
+
+```bash
+# From a local path during development:
+amplifier-resolve resolver add ./hello-world
+
+# ...or from a git URL:
+amplifier-resolve resolver add 'git+https://github.com/you/hello-world@main'
+
+# Confirm it registered:
+amplifier-resolve resolver list
+```
+
+You can also verify over the API:
+
+```bash
+curl -s "$RESOLVE_URL/api/resolvers" -H "Authorization: Bearer $TOKEN" | jq '.[].name'
+```
+
+## Step 4 — Run an instance through it
+
+Submit an instance that targets your resolver, then watch it work:
+
+```bash
+# Create the instance
+curl -s -X POST "$RESOLVE_URL/api/instances" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"resolver": "hello-world", "input": {"name": "world"}}'
+# -> { "instance_id": "abc123...", ... }
+```
+
+Then stream its events (Server-Sent Events) until it completes:
+
+```bash
+curl -N "$RESOLVE_URL/api/instances/abc123/events" \
+  -H "Authorization: Bearer $TOKEN"
+# resolver:created ... resolver:phase ... resolver:artifact ... resolver:completed
+```
+
+When you see `resolver:completed`, the instance transitions to the terminal
+`completed` state. You've just exercised the full contract.
+
+## What you just touched
+
+<Card title="The four contracts" icon="approve-check">
+- **manifest.json** — how the platform launches and registers your resolver
+- **Event vocabulary** — the `created → phase → artifact → completed` chain
+- **Registration** — `resolver add` writing to `resolvers.json`, live-reloaded
+- **Instance lifecycle** — `created → running → completed`
+</Card>
+
+## Next steps
+
+- Go deeper on each contract in [Build a Resolver](/resolve/build/resolver-protocol/).
+- Add a custom UI with a [Viewport](/resolve/build/viewports/).
+- Verify generated software with a [Reality Check](/resolve/get-started/reality-check/).
+- Understand the full [Instance Lifecycle](/resolve/architecture/lifecycle/).

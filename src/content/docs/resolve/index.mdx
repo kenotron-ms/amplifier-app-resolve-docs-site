@@ -1,0 +1,49 @@
+---
+title: "What is Resolve?"
+description: "Resolve is Amplifier's autonomous code-generation platform. Write resolvers, submit instances, stream events, and verify results with reality checks."
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+**Resolve** is Amplifier's autonomous code-generation platform. You submit a
+task as an **instance**, a pluggable **resolver** executes it in an isolated
+container, and you watch progress through a live **event stream** — optionally
+verifying the result against acceptance criteria with a **reality check**.
+
+Resolve is a multi-repo system: a FastAPI backend, a React frontend, and a set
+of resolver plugins (each with its own viewport UI). This section documents how
+to build on it and operate it.
+
+## Start here
+
+<CardGrid>
+  <Card title="Your first resolver" icon="rocket">
+    The golden path: from zero to a running custom resolver in one sitting.
+
+    [Build a resolver →](/resolve/get-started/first-resolver/)
+  </Card>
+  <Card title="Run a reality check" icon="approve-check">
+    Verify that generated software actually meets your acceptance criteria.
+
+    [Run a reality check →](/resolve/get-started/reality-check/)
+  </Card>
+  <Card title="Core concepts" icon="open-book">
+    Instances, resolvers, viewports, pipelines, events, and the container model.
+
+    [Learn the concepts →](/resolve/get-started/concepts/)
+  </Card>
+</CardGrid>
+
+## The four sections
+
+<LinkCard title="Get Started" href="/resolve/get-started/first-resolver/" description="Golden paths and core concepts — the fastest route to productive." />
+<LinkCard title="Build a Resolver" href="/resolve/build/resolver-protocol/" description="The Resolver Protocol, manifest.json, event vocabulary, A2UI, DOT pipelines, and viewports." />
+<LinkCard title="Use the Platform" href="/resolve/use/api/" description="The REST API, instance specs, the auth model, and reality-check usage." />
+<LinkCard title="Architecture & Ops" href="/resolve/architecture/overview/" description="Platform architecture, instance lifecycle, the container model, and single-VM deployment." />
+
+## For AI agents
+
+The entire Resolve corpus is available as a single fetch at
+[`/resolve/llms-full.txt`](/resolve/llms-full.txt), and the ecosystem index at
+[`/llms.txt`](/llms.txt). Point your agent there to author resolvers or drive
+the platform without reading source.

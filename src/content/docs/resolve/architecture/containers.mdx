@@ -1,0 +1,242 @@
+---
+title: "Container & Data Model"
+description: "How worker containers are structured, the filesystem layout, how data flows between host and resolver, and the three-layer safety model."
+---
+
+import { Aside, Card } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+
+Every instance runs in an isolated **worker container** managed by the platform
+orchestrator. The container's filesystem is the coordination medium — the host writes
+to it, the resolver reads and writes to it, and the monitor polls it.
+
+---
+
+## Container topology
+
+```
+Host machine
+│
+├── Incus container: resolve-{id}          ← main worker
+│   │
+│   ├── /project/
+│   │   ├── .resolve/                     ← coordination directory (platform-managed)
+│   │   │   ├── config.json               ← InstanceConfig written by host at startup
+│   │   │   ├── events.jsonl              ← resolver writes; host mirrors via monitor
+│   │   │   ├── state.json                ← resolver writes (atomic); host polls
+│   │   │   ├── status.json               ← resolver-reported status checkpoints
+│   │   │   ├── input-requests/
+│   │   │   │   ├── {rid}.json            ← A2UI schema, written by SDK via resolver
+│   │   │   │   └── {rid}.response.json   ← response payload, written by host
+│   │   │   ├── messages/
+│   │   │   │   ├── 001.json              ← consumer messages, written by host
+│   │   │   │   └── 002.json
+│   │   │   └── data/                     ← resolver artifacts, fetched on demand
+│   │   │       ├── graph.dot
+│   │   │       └── progress.json
+│   │   └── workspace/
+│   │       └── {repo}/                   ← repos cloned by host before run()
+│   │
+│   └── Resolver process (python -m my_resolver)
+│       └── amplifier-resolver-sdk (stdio JSON-RPC)
+│
+├── Incus container: resolve-{id}-gitea    ← Gitea sidecar (optional)
+│   └── Local git server for workspace repos
+│
+└── Incus container: resolve-{id}-env-{uuid}  ← ephemeral sub-container (optional)
+    └── Sandboxed step execution
+```
+
+---
+
+## Who owns what
+
+| Path | Written by | Read by | Notes |
+|------|-----------|---------|-------|
+| `.resolve/config.json` | Host (at startup) | Resolver | `InstanceConfig`: instance_id, params, credentials |
+| `.resolve/events.jsonl` | Resolver (via SDK) | Host monitor | Append-only; flushed immediately |
+| `.resolve/state.json` | Resolver (via SDK) | Host monitor | Overwritten atomically via `os.replace()` |
+| `.resolve/status.json` | Resolver | Host monitor | Optional resolver-reported checkpoints |
+| `.resolve/input-requests/{rid}.json` | SDK (resolver calls request_input) | Host monitor | A2UI schema + prompt |
+| `.resolve/input-requests/{rid}.response.json` | Host | Resolver (SDK returns future) | Consumer's response payload |
+| `.resolve/messages/{N}.json` | Host | Resolver | Sequentially numbered consumer messages |
+| `.resolve/data/{path}` | Resolver | Consumers via API | On-demand artifacts, any format |
+| `/project/workspace/{repo}` | Host (before run()) | Resolver | Git repos cloned by orchestrator |
+| `/usr/local/bin/create-pr` | Host (injected at startup) | Resolver | Provider-agnostic PR creation script |
+
+---
+
+## Coordination flows
+
+### Input request flow
+
+<Mermaid code={`
+sequenceDiagram
+    participant R  as Resolver
+    participant FS as .resolve/
+    participant M  as Monitor
+    participant AP as API
+    participant C  as Consumer
+
+    R->>FS: write input-requests/req-001.json
+    M->>FS: poll — discover new file
+    M->>AP: register pending request
+    M-->>C: SSE resolve.input.requested
+    C->>AP: GET /instances/{id}/input-requests
+    AP-->>C: [{schema, prompt}]
+    C->>AP: POST /input-requests/req-001 {decision}
+    AP->>AP: validate A2UI schema
+    AP->>FS: write req-001.response.json
+    AP->>R: on_input_response(req_id, payload)
+    Note over R,AP: status → running
+`} />
+
+### Message flow
+
+<Mermaid code={`
+sequenceDiagram
+    participant C  as Consumer
+    participant AP as API
+    participant R  as Resolver
+    participant FS as .resolve/
+
+    C->>AP: GET /instances/{id}/message-types
+    AP->>R: message_types(instance_state)
+    R-->>AP: [{name, label, schema}]
+    AP-->>C: message type catalog
+
+    C->>AP: POST /instances/{id}/messages\n{message_type, payload}
+    AP->>AP: validate against schema
+    AP->>FS: write messages/001.json
+    AP->>R: on_message(type, payload)
+    AP-->>C: 202 {accepted: true}
+`} />
+
+### Data file flow
+
+<Mermaid code={`
+sequenceDiagram
+    participant R  as Resolver
+    participant FS as .resolve/data/
+    participant C  as Consumer / Viewport
+    participant AP as GET /data/{path}
+
+    R->>FS: write graph.dot, progress.json
+    R->>R: emit my_resolver.data_changed {paths}
+    C->>C: SSE — sees data_changed event
+    C->>AP: GET /instances/{id}/data/graph.dot
+    AP->>FS: container exec cat /project/.resolve/data/graph.dot
+    AP-->>C: file content (auto Content-Type)
+    Note over AP: path traversal blocked → 400\\ncontainer unreachable → 502\\nfile not found → 404
+`} caption="Data is never pushed or polled — resolver signals what changed, consumer fetches on demand" />
+
+---
+
+## Event streaming: files are the API
+
+<Mermaid code={`
+flowchart LR
+    R["⚙️ Resolver\nemitter.emit()"] -->|"append\n(flushed immediately)"| F[("📄 events.jsonl")]
+    F -->|"poll\nnew lines"| M["Monitor\nread loop"]
+    M -->|push| EB["EventBus"]
+    EB -->|SSE| C["Consumers\nSPA · curl · Python · agent"]
+`} caption="events.jsonl is the source of truth — SSE is a convenience layer" />
+
+The `events.jsonl` file on disk IS the source of truth. The SSE endpoint is a
+convenience layer over this file. You can always `tail -f` the file directly on the
+host machine.
+
+```bash
+# Direct file access on host
+tail -f ~/.amplifier/resolve/instances/{instance_id}/events/events.jsonl
+
+# Or via API
+curl -N "$RESOLVE_URL/api/instances/{id}/events?token=$TOKEN"
+```
+
+---
+
+## Container safety: three-layer defense
+
+After a production incident where 4,269 runaway `pytest` processes consumed 103 GiB
+of RAM and triggered OOM kills, the platform implements a three-layer defense:
+
+<Mermaid code={`
+flowchart TD
+    Req(["🔧 Tool execution requested"])
+
+    subgraph L2 ["Layer 2 — Process Guardian Hook (application, runs every tool call)"]
+        L2a["Count processes · block if > 128 PIDs\nKill orphan pytest / node.*test processes\nDetect repeat commands (5× in 60s → block)"]
+    end
+
+    subgraph L3 ["Layer 3 — Watchdog Loop (orchestrator background task)"]
+        L3a["Warn at 200 PIDs (kernel kills at 256)\nWarn at 80% of 8 GiB memory\n12-hour instance lifetime limit"]
+    end
+
+    subgraph L1 ["Layer 1 — Kernel Limits (enforced at container creation, cannot be bypassed)"]
+        L1a["--pids-limit 256  --memory 8g  --memory-swap 8g\n--cpus 2.0  --init Tini"]
+    end
+
+    Req --> L2
+    L2 -->|"if Layer 2 misses it"| L3
+    L3 -->|"absolute last resort"| L1
+
+    style L2 fill:#1e3a5f,stroke:#3b82f6,color:#93c5fd
+    style L3 fill:#1a3d2b,stroke:#22c55e,color:#86efac
+    style L1 fill:#3d1a1a,stroke:#ef4444,color:#fca5a5
+`} caption="Three-layer defense — each layer catches what the one above misses, no single layer is trusted" />
+
+**Layer 1** is the kernel-enforced backstop — it fires after the application layers
+fail. **Layer 2** prevents most runaway scenarios before they escalate. **Layer 3**
+catches slow-burn resource exhaustion between tool calls.
+
+The three layers are deliberately redundant. No single layer is trusted.
+
+---
+
+## `InstanceConfig` — what the resolver receives
+
+The host writes `/project/.resolve/config.json` before calling `run()`. This is the
+source of truth for everything the resolver needs:
+
+```json
+{
+  "instance_id": "a1b2c3d4e5f6",
+  "resolver_name": "understudy",
+  "params": {
+    "spec": "Add GET /api/ping endpoint...",
+    "repo": "myorg/myrepo"
+  },
+  "workspace_path": "/project/workspace",
+  "git_provider": {
+    "type": "gitea",
+    "base_url": "http://localhost:3000",
+    "token": "..."
+  },
+  "credentials": {
+    "anthropic_api_key": "sk-...",
+    "gh_token": "ghp_..."
+  },
+  "sub_container_token": "...",
+  "capabilities": ["gitea"]
+}
+```
+
+The resolver reads this via the SDK's `config` parameter to `run()`. Never read it
+directly — the SDK provides typed accessors.
+
+---
+
+## Gitea sidecar
+
+When `capabilities_required: ["gitea"]` is set in `manifest.json`, the host spawns a
+Gitea container (`resolve-{id}-gitea`) before calling `run()`. This provides a local
+git server with:
+
+- A working repository mirroring each cloned workspace repo
+- A `create-pr` script in the worker container that pushes to Gitea and creates PRs
+- Full Gitea REST API accessible from the worker at a known URL
+
+Resolvers use Gitea to manage their working branch and create PRs without needing
+network access to GitHub during implementation. The platform handles the GitHub →
+Gitea mirror and Gitea → GitHub PR promotion.

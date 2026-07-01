@@ -1,0 +1,245 @@
+---
+title: "Instance Lifecycle"
+description: "Every status an instance can have, how it transitions between them, and what to expect at each stage."
+---
+
+import { Aside, Card } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+
+An instance moves through a well-defined state machine from creation to terminal
+state. Understanding the lifecycle is essential for building reliable consumers —
+dashboards, CI integrations, and agent interfaces all need to handle the full
+transition graph.
+
+---
+
+## State machine
+
+<Mermaid code={`
+flowchart LR
+    S(["▶ start"]) --> created
+
+    created["created"]
+    starting["starting"]
+    running["running"]
+    awaiting["awaiting_input"]
+    paused["paused"]
+    completed(["✓ completed"])
+    failed(["✗ failed"])
+    cancelled(["⊘ cancelled"])
+
+    S --> created
+    created --> starting
+    starting --> running
+    starting --> failed
+
+    running --> awaiting
+    awaiting --> running
+    running --> paused
+    paused --> running
+
+    running --> completed
+    running --> failed
+    running --> cancelled
+    awaiting --> cancelled
+    paused --> cancelled
+
+    style completed fill:#15803d,color:#fff,stroke:#166534
+    style failed    fill:#b91c1c,color:#fff,stroke:#991b1b
+    style cancelled fill:#6b7280,color:#fff,stroke:#4b5563
+    style running   fill:#1d4ed8,color:#fff,stroke:#1e40af
+    style awaiting  fill:#d97706,color:#fff,stroke:#b45309
+    style paused    fill:#7c3aed,color:#fff,stroke:#6d28d9
+    style created   fill:#0891b2,color:#fff,stroke:#0e7490
+    style starting  fill:#0891b2,color:#fff,stroke:#0e7490
+`} caption="Instance state machine — happy path is created → starting → running → completed" />
+
+---
+
+## Status values
+
+| Status | Terminal? | Description |
+|--------|-----------|-------------|
+| `created` | No | Instance record persisted; container not yet provisioned |
+| `starting` | No | Container launching; setup commands running; worker initializing |
+| `running` | No | Resolver is actively executing inside the container |
+| `awaiting_input` | No | Resolver wrote an input request and is waiting for a response |
+| `paused` | No | Resolver execution paused; resumable via `POST /resume` |
+| `completed` | **Yes** | Resolver finished successfully |
+| `failed` | **Yes** | Resolver encountered an unrecoverable error |
+| `cancelled` | **Yes** | Instance was cancelled via `DELETE` or `POST /stop` |
+
+The **happy path** is: `created → starting → running → completed`.
+
+---
+
+## Phase progression
+
+Each resolver defines its own phase progression. The host platform does not
+prescribe phases — it tracks status transitions and exposes `phase` through
+the state snapshot and events.
+
+Common patterns across resolver implementations:
+
+<Mermaid code={`
+flowchart TD
+    A["🎯 aligning\nunderstand task · clarify intent"]
+    P["📋 planning\nproduce implementation plan"]
+    I["⚙️ implementing\nexecute plan · TDD loops"]
+    G{"build/test gate\nexit 0?"}
+    V["✅ verifying\nreality check · review"]
+    D["📦 delivering\nbranch · commit · push · PR"]
+    Done(["🎉 completed"])
+
+    A --> P --> I --> G
+    G -->|pass| V --> D --> Done
+    G -->|fail — fix loop| I
+
+    style Done fill:#15803d,color:#fff,stroke:#166534
+    style G    fill:#92400e,color:#fff,stroke:#78350f
+`} caption="Common resolver phase progression — exact phases vary by resolver" />
+
+The exact phases, their names, and durations vary by resolver. Read each resolver's
+documentation for its specific phase taxonomy.
+
+---
+
+## Input requests — recovery flow
+
+When a resolver cannot proceed without human input, it writes an A2UI input request
+and the instance transitions to `awaiting_input`.
+
+<Mermaid code={`
+sequenceDiagram
+    participant R as Resolver (run())
+    participant FS as File System
+    participant M as Monitor
+    participant API as REST API
+    participant C as Consumer
+
+    R->>FS: write input-requests/gate-001.json
+    M->>FS: discover new file (poll)
+    M->>API: expose via /input-requests
+    M-->>C: SSE resolve.input.requested
+    Note over API: status → awaiting_input
+
+    C->>API: GET /instances/{id}/input-requests?status=pending
+    API-->>C: [{id, prompt, schema}]
+    C->>API: POST /instances/{id}/input-requests/gate-001
+    Note right of C: {decision: "retry"}
+    API->>FS: write gate-001.response.json
+    API->>R: on_input_response("gate-001", payload)
+    Note over API: status → running
+`} caption="Input request flow — resolver pauses, consumer responds, execution resumes" />
+
+---
+
+## Pause / resume
+
+`paused` is for intentional checkpoints — the resolver decides to stop and persist
+state for later resumption. Unlike `awaiting_input`, there is no pending request to
+respond to. You resume explicitly.
+
+Requirements:
+1. Resolver returns `ResolverResult(status="paused")` from `run()`
+2. Resolver's `supports_resume` must be `True`
+3. Resolver must have saved checkpoint state before returning `paused`
+
+```bash
+# Resume a paused instance
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  "$RESOLVE_URL/api/instances/$INSTANCE_ID/resume"
+```
+
+The platform calls `resolver.run(config, session_factory, emitter, resume=True)`.
+The resolver reads its checkpoint state and continues.
+
+---
+
+## Graceful stop
+
+`POST /instances/{id}/stop` sends a stop request to the running resolver:
+
+1. Platform calls `resolver.stop(reason: str)` → resolver should checkpoint and return
+2. Resolver returns any `ResolverResult` (typically `status="cancelled"`)
+3. Platform sets final instance status accordingly
+4. If resolver doesn't respond in time → platform force-terminates the container
+
+```bash
+# Request graceful stop
+curl -X POST "$RESOLVE_URL/api/instances/$INSTANCE_ID/stop" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "user requested stop"}'
+```
+
+---
+
+## Duration expectations
+
+| Spec complexity | Typical duration |
+|-----------------|-----------------|
+| Simple (1-2 endpoints) | 10–20 minutes |
+| Medium (3-5 endpoints) | 20–35 minutes |
+| Complex (6+ endpoints) | 35–60 minutes |
+| Multi-feature projects | 1–3 hours |
+
+Instances that escalate to `awaiting_input` pause until the user responds. Container
+setup adds 15 seconds (cached) or ~5 minutes (cold) to the first run.
+
+---
+
+## Monitoring lifecycle in practice
+
+### Poll for terminal state
+
+```python
+import time, requests
+
+def wait_for_terminal(instance_id: str, base_url: str, token: str) -> dict:
+    headers = {"Authorization": f"Bearer {token}"}
+    TERMINAL = {"completed", "failed", "cancelled"}
+
+    while True:
+        resp = requests.get(f"{base_url}/api/instances/{instance_id}", headers=headers)
+        instance = resp.json()
+        status = instance["status"]
+
+        if status in TERMINAL:
+            return instance
+
+        if status == "awaiting_input":
+            # Check for pending input requests
+            reqs = requests.get(
+                f"{base_url}/api/instances/{instance_id}/input-requests?status=pending",
+                headers=headers
+            ).json()
+            if reqs:
+                print(f"Waiting for input: {reqs[0]['prompt']}")
+
+        time.sleep(15)
+```
+
+### Watch via SSE
+
+```bash
+# Stream all events until the instance terminates
+curl -N "$RESOLVE_URL/api/instances/$INSTANCE_ID/events?token=$TOKEN" | while IFS= read -r line; do
+  [[ "$line" != data:* ]] && continue
+  EVENT="${line#data: }"
+  TYPE=$(echo "$EVENT" | jq -r '.event_type // .type')
+  echo "[$TYPE]"
+  [[ "$TYPE" == "done" ]] && break
+done
+```
+
+### Read status events from the stream
+
+```python
+# Extract the lifecycle from events
+status_changes = [
+    {"from": e["data"]["from"], "to": e["data"]["to"], "at": e["timestamp"]}
+    for e in events
+    if e.get("event_type") == "resolve.instance.status_changed"
+]
+```

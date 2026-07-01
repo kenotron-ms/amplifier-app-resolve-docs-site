@@ -1,0 +1,193 @@
+---
+/**
+ * Mermaid.astro — Full-bleed Mermaid diagram renderer for Starlight.
+ *
+ * Usage in MDX:
+ *   import Mermaid from '../../../../components/Mermaid.astro';
+ *   <Mermaid code={`flowchart LR\n  A --> B`} />
+ *   <Mermaid code={`stateDiagram-v2\n  ...`} caption="State machine" />
+ */
+interface Props {
+  code: string;
+  caption?: string;
+}
+const { code, caption } = Astro.props;
+---
+
+<figure class="mermaid-figure">
+  <div class="mermaid-container">
+    <div class="sl-mermaid">{code}</div>
+  </div>
+  {caption && <figcaption class="mermaid-caption">{caption}</figcaption>}
+</figure>
+
+<script>
+import mermaid from 'mermaid';
+
+const DARK: Record<string, string> = {
+  background:             '#0d1117',
+  primaryColor:           '#1c3461',
+  primaryTextColor:       '#e2e8f0',
+  primaryBorderColor:     '#3b82f6',
+  lineColor:              '#475569',
+  secondaryColor:         '#162035',
+  tertiaryColor:          '#0d1a2d',
+  clusterBkg:             '#162035',
+  clusterBorder:          '#334155',
+  titleColor:             '#93c5fd',
+  edgeLabelBackground:    '#1c3461',
+  actorBkg:               '#1c3461',
+  actorBorder:            '#3b82f6',
+  actorTextColor:         '#e2e8f0',
+  actorLineColor:         '#475569',
+  signalColor:            '#64748b',
+  signalTextColor:        '#e2e8f0',
+  labelBoxBkgColor:       '#1c3461',
+  labelBoxBorderColor:    '#3b82f6',
+  labelTextColor:         '#e2e8f0',
+  loopTextColor:          '#e2e8f0',
+  activationBorderColor:  '#3b82f6',
+  activationBkgColor:     '#162035',
+  sequenceNumberColor:    '#93c5fd',
+  noteBkgColor:           '#1a2744',
+  noteBorderColor:        '#334155',
+  noteTextColor:          '#94a3b8',
+  stateBkg:               '#1c3461',
+  stateLabelColor:        '#e2e8f0',
+  transitionColor:        '#475569',
+  transitionLabelColor:   '#94a3b8',
+};
+
+const LIGHT: Record<string, string> = {
+  background:             '#ffffff',
+  primaryColor:           '#dbeafe',
+  primaryTextColor:       '#1e3a5f',
+  primaryBorderColor:     '#3b82f6',
+  lineColor:              '#94a3b8',
+  secondaryColor:         '#eff6ff',
+  tertiaryColor:          '#f1f5f9',
+  clusterBkg:             '#eff6ff',
+  clusterBorder:          '#bfdbfe',
+  titleColor:             '#1d4ed8',
+  edgeLabelBackground:    '#dbeafe',
+  actorBkg:               '#dbeafe',
+  actorBorder:            '#3b82f6',
+  actorTextColor:         '#1e3a5f',
+  actorLineColor:         '#94a3b8',
+  signalColor:            '#64748b',
+  signalTextColor:        '#1e3a5f',
+  labelBoxBkgColor:       '#dbeafe',
+  labelBoxBorderColor:    '#3b82f6',
+  labelTextColor:         '#1e3a5f',
+  loopTextColor:          '#1e3a5f',
+  activationBorderColor:  '#3b82f6',
+  activationBkgColor:     '#dbeafe',
+  sequenceNumberColor:    '#1d4ed8',
+  noteBkgColor:           '#eff6ff',
+  noteBorderColor:        '#bfdbfe',
+  noteTextColor:          '#475569',
+  stateBkg:               '#dbeafe',
+  stateLabelColor:        '#1e3a5f',
+  transitionColor:        '#94a3b8',
+  transitionLabelColor:   '#475569',
+};
+
+function normalizeSvg(el: HTMLElement): void {
+  const svg = el.querySelector('svg');
+  if (!svg) return;
+  if (!svg.getAttribute('viewBox') && svg.getAttribute('width') && svg.getAttribute('height')) {
+    const w = svg.getAttribute('width')!.replace(/[^0-9.]/g, '');
+    const h = svg.getAttribute('height')!.replace(/[^0-9.]/g, '');
+    if (w && h) svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  }
+  svg.removeAttribute('width');
+  svg.removeAttribute('height');
+  svg.style.cssText = 'width:100%;height:auto;max-width:100%;display:block;';
+}
+
+async function renderAll(): Promise<void> {
+  const dark = document.documentElement.getAttribute('data-theme') === 'dark';
+
+  mermaid.initialize({
+    startOnLoad:   false,
+    theme:         dark ? 'dark' : 'base',
+    securityLevel: 'loose',
+    fontFamily:    '-apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", sans-serif',
+    fontSize:      15,
+    flowchart: { curve: 'basis', padding: 28, htmlLabels: true, useMaxWidth: true },
+    sequence: {
+      diagramMarginX: 24, diagramMarginY: 16, actorMargin: 64,
+      width: 150, height: 65, boxMargin: 10, messageMargin: 35,
+      mirrorActors: false, useMaxWidth: true, showSequenceNumbers: false,
+    },
+    themeVariables: dark ? DARK : LIGHT,
+  });
+
+  const nodes = Array.from(document.querySelectorAll<HTMLElement>('.sl-mermaid'));
+  if (!nodes.length) return;
+
+  nodes.forEach(el => {
+    el.removeAttribute('data-processed');
+    const orig = el.getAttribute('data-original');
+    if (orig) el.textContent = orig;
+    else el.setAttribute('data-original', el.textContent ?? '');
+  });
+
+  try {
+    await mermaid.run({ nodes });
+    nodes.forEach(normalizeSvg);
+  } catch (e) {
+    console.warn('[Mermaid] render error:', e);
+  }
+}
+
+const boot = () => renderAll();
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+else boot();
+
+new MutationObserver(mutations => {
+  for (const m of mutations) {
+    if (m.attributeName === 'data-theme') { renderAll(); break; }
+  }
+}).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+</script>
+
+<style>
+.mermaid-figure {
+  margin: 2rem calc(-1 * var(--sl-content-pad-x, 1rem));
+}
+
+.mermaid-container {
+  width: 100%;
+  overflow-x: auto;
+  background: var(--sl-color-bg-nav, #f8fafc);
+  border-top: 1px solid var(--sl-color-hairline, rgba(0,0,0,.08));
+  border-bottom: 1px solid var(--sl-color-hairline, rgba(0,0,0,.08));
+  padding: 2.5rem 2rem;
+}
+
+:global([data-theme='dark']) .mermaid-container {
+  background: rgba(255,255,255,.025);
+  border-color: rgba(255,255,255,.08);
+}
+
+.sl-mermaid { font-size: 0; line-height: 0; }
+.sl-mermaid svg {
+  width: 100% !important;
+  height: auto !important;
+  max-width: 100% !important;
+  display: block;
+  font-size: 15px;
+  line-height: 1.4;
+  margin: 0 auto;
+}
+
+.mermaid-caption {
+  display: block;
+  text-align: center;
+  font-size: 0.8125rem;
+  color: var(--sl-color-gray-3, #64748b);
+  margin: 0.625rem var(--sl-content-pad-x, 1rem) 0;
+  font-style: italic;
+}
+</style>

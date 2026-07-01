@@ -1,0 +1,284 @@
+---
+title: "Viewports"
+description: "Build a custom React UI for your resolver — the viewport ESM bundle contract, ViewportProps API, and Vite build config."
+---
+
+import { Aside, Card } from '@astrojs/starlight/components';
+
+A **viewport** is the custom UI your resolver ships for the React frontend. When an
+instance is running with a resolver that has a viewport registered, the frontend loads
+your ESM bundle and mounts it into the instance panel. Without a viewport, the
+platform renders a generic event log + state + input-request UI.
+
+Viewports give you full control over the visual experience: custom progress displays,
+live graph rendering, artifact previews, interactive controls.
+
+---
+
+## How viewports integrate
+
+```
+manifest.json
+  └── viewport_bundle: "git+https://github.com/myorg/my-viewport@main"
+  └── viewport_path:   "dist/viewport.js"
+                           │
+                           ▼
+amplifier-resolve resolver add ...
+    ├── fetches viewport_bundle from git
+    ├── reads the file at viewport_path
+    └── registers it in the resolver catalog
+
+At runtime:
+    Frontend sees resolver has a viewport
+    ├── loads viewport.js as an ES module
+    ├── calls viewport.mount(container, props)
+    └── your React component renders in the panel
+```
+
+---
+
+## `ViewportProps` — the interface
+
+Your viewport's `mount` function receives a `ViewportProps` object:
+
+```typescript
+interface ViewportProps {
+  /** The instance this viewport is rendering */
+  instanceId: string;
+
+  /** Base URL of the Resolve backend */
+  baseUrl: string;
+
+  /** Current instance status */
+  status: InstanceStatus;
+
+  /** Fetch a file from the resolver's /project/.resolve/data/ directory */
+  fetchData: (path: string) => Promise<Response>;
+
+  /** Subscribe to SSE events for this instance */
+  onEvent: (handler: (event: ResolveEvent) => void) => () => void;
+
+  /** Send a message to the resolver */
+  sendMessage: (messageType: string, payload: object) => Promise<void>;
+
+  /** Respond to an input request */
+  respondToInputRequest: (requestId: string, payload: object) => Promise<void>;
+}
+
+type InstanceStatus = 
+  | "created" | "starting" | "running" | "awaiting_input"
+  | "paused" | "completed" | "failed" | "cancelled";
+
+interface ResolveEvent {
+  schema_version: number;
+  timestamp: string;
+  instance_id: string;
+  event_type: string;
+  phase: string | null;
+  data: Record<string, unknown>;
+}
+```
+
+---
+
+## Viewport entry point
+
+Your viewport bundle must export a `mount` function as its default export:
+
+```typescript
+// src/viewport.ts
+import { createRoot } from "react-dom/client";
+import { ViewportApp } from "./ViewportApp";
+
+export default function mount(
+  container: HTMLElement,
+  props: ViewportProps
+): () => void {
+  const root = createRoot(container);
+  root.render(<ViewportApp {...props} />);
+
+  // Return cleanup function
+  return () => {
+    root.unmount();
+  };
+}
+```
+
+---
+
+## Fetching resolver data
+
+Use `props.fetchData(path)` to read files from `/project/.resolve/data/{path}` inside
+the running container. This is how your viewport reads artifacts produced by the
+resolver.
+
+```typescript
+// Resolver writes: /project/.resolve/data/graph.dot
+// Viewport reads it:
+
+const response = await props.fetchData("graph.dot");
+const dotSource = await response.text();
+renderGraph(dotSource);
+```
+
+```typescript
+// Resolver writes: /project/.resolve/data/progress.json
+const response = await props.fetchData("progress.json");
+const progress = await response.json();
+setProgress(progress);
+```
+
+The convention is for the resolver to emit a `data_changed` event with the affected
+paths, so the viewport can re-fetch only what changed:
+
+```typescript
+props.onEvent((event) => {
+  if (event.event_type === "my_resolver.data_changed") {
+    const paths: string[] = event.data.paths;
+    paths.forEach(path => refreshData(path));
+  }
+});
+```
+
+---
+
+## Subscribing to events
+
+```typescript
+// Subscribe to all events
+const unsubscribe = props.onEvent((event) => {
+  switch (event.event_type) {
+    case "resolver:phase":
+      setCurrentPhase(event.data.name as string);
+      break;
+    case "resolver:artifact":
+      addArtifact(event.data);
+      break;
+    case "resolve.instance.status_changed":
+      setStatus(event.data.to as InstanceStatus);
+      break;
+  }
+});
+
+// Clean up on unmount
+return () => unsubscribe();
+```
+
+---
+
+## Sending messages
+
+When the resolver declares message types, the viewport can send them:
+
+```typescript
+// Send user feedback
+await props.sendMessage("user_feedback", {
+  text: "Please focus on the authentication middleware"
+});
+
+// Trigger a checkpoint
+await props.sendMessage("checkpoint", {});
+```
+
+---
+
+## Responding to input requests
+
+When the instance is `awaiting_input`, render the pending requests and respond:
+
+```typescript
+// Fetch pending input requests
+const response = await fetch(
+  `${props.baseUrl}/api/instances/${props.instanceId}/input-requests?status=pending`,
+  { headers: { "Authorization": `Bearer ${getToken()}` } }
+);
+const requests = await response.json();
+
+// Respond to a request
+await props.respondToInputRequest("gate-001", {
+  decision: "retry"
+});
+```
+
+---
+
+## Build configuration (Vite)
+
+Viewports are built as ES modules using Vite. A minimal `vite.config.ts`:
+
+```typescript
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  build: {
+    lib: {
+      entry: "src/viewport.ts",
+      formats: ["es"],
+      fileName: () => "viewport.js",
+    },
+    outDir: "dist",
+    rollupOptions: {
+      // Externalize React — the platform provides it
+      external: ["react", "react-dom"],
+      output: {
+        globals: {
+          react: "React",
+          "react-dom": "ReactDOM",
+        },
+      },
+    },
+  },
+});
+```
+
+<Aside type="caution" title="Externalize React">
+Always externalize `react` and `react-dom`. The platform provides them via import
+map. Bundling React into your viewport causes version conflicts and doubles the
+bundle size.
+</Aside>
+
+---
+
+## Registering in `manifest.json`
+
+```json
+{
+  "name": "my-resolver",
+  "version": "1.0.0",
+  "description": "...",
+  "command": ["python", "-m", "my_resolver"],
+  "viewport_bundle": "git+https://github.com/myorg/my-resolver-viewport@main",
+  "viewport_path": "dist/viewport.js"
+}
+```
+
+After `amplifier-resolve resolver add`, the viewport is registered and immediately
+available. The frontend loads it dynamically — no backend restart needed.
+
+---
+
+## Local development
+
+During development, use the `?viewport_override=<url>` query parameter to load your
+viewport from a local dev server instead of the registered bundle:
+
+```bash
+# Start your Vite dev server
+cd my-viewport && npm run dev
+# Vite serves viewport.js at http://localhost:5173/dist/viewport.js
+
+# Open the platform UI with override
+open "http://localhost:10120?viewport_override=http://localhost:5173/dist/viewport.js"
+```
+
+The platform UI loads your local viewport bundle for all instances of your resolver.
+Hot module replacement works with Vite's dev server.
+
+<Aside type="tip" title="No auth on viewport.js">
+The `viewport.js` path bypasses authentication — the frontend loads it before
+authentication state is resolved. Design your viewport JS to be safe to load
+without credentials. The data-fetching calls (`fetchData`, `sendMessage`) are
+auth-gated at the API level.
+</Aside>

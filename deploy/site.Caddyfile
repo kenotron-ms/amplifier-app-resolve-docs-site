@@ -1,0 +1,17 @@
+# Static server for the built Amplifier docs site — bound to :8092.
+# Public exposure + auth happen at the main Caddy + oauth2-proxy layer
+# (docs.ampbox.io -> oauth2-proxy :4182 -> here). `admin off` avoids clashing
+# with the main Caddy admin API on :2019.
+{
+	admin off
+}
+
+# Match ANY Host header (oauth2-proxy forwards Host: docs.ampbox.io).
+http://:8092 {
+	bind 0.0.0.0
+	root * /home/ken/workspace/resolve-work/amplifier-docs/dist
+	# Starlight emits directory-style routes; resolve them to index.html.
+	try_files {path} {path}/index.html {path}.html
+	file_server
+	encode gzip
+}

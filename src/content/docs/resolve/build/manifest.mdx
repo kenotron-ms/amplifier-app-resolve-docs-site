@@ -1,0 +1,305 @@
+---
+title: "manifest.json Reference"
+description: "Complete field reference for the resolver manifest — the registration contract between your resolver and the Resolve platform."
+---
+
+import { Aside, Card } from '@astrojs/starlight/components';
+
+The `manifest.json` file is how a resolver registers itself with the Resolve platform.
+When you run `amplifier-resolve resolver add ./my-resolver`, the platform validates
+this file against a JSON Schema and writes an entry into the resolver catalog. No
+manifest, no registration.
+
+---
+
+## Minimal manifest
+
+```json
+{
+  "name": "my-resolver",
+  "version": "0.1.0",
+  "description": "Builds REST endpoints from a natural-language spec",
+  "command": ["python", "-m", "my_resolver"]
+}
+```
+
+These four fields are the only required ones for a resolver that runs directly (no
+container setup). Everything else is optional.
+
+---
+
+## Required fields
+
+### `name` — string (kebab-case)
+
+Unique resolver identifier. Must be lowercase kebab-case. Used as the resolver name
+in `POST /instances`, `GET /resolvers`, event prefixes, and the catalog key.
+
+```json
+"name": "dot-graph"
+```
+
+<Aside type="caution" title="Names are permanent">
+Changing a resolver's name after instances have been created breaks those instances'
+event history. Choose a name you can live with.
+</Aside>
+
+### `version` — string (semver)
+
+Semver version string. Used in `GET /resolvers` and resolver event payloads. Must
+match the `version` property returned by the resolver's Python class.
+
+```json
+"version": "1.2.0"
+```
+
+### `description` — string
+
+Human-readable description shown in `GET /resolvers` and the platform UI. One
+sentence, no trailing period.
+
+```json
+"description": "Autonomous implementation via a DOT-format attractor pipeline"
+```
+
+### `command` — array of strings
+
+The command used to launch the resolver process **outside a container** (local dev,
+testing). Must be a runnable command on the host.
+
+```json
+"command": ["python", "-m", "my_resolver"]
+```
+
+<Aside type="note" title="container.command overrides in production">
+When running inside a worker container, the platform uses `container.command` if
+present. `command` is used as a fallback and for local development only.
+</Aside>
+
+---
+
+## Optional top-level fields
+
+### `supports_resume` — boolean (default: `false`)
+
+Set `true` if the resolver's `run()` can restart from a checkpoint after
+`POST /instances/{id}/resume`. Exposes the resume endpoint in the platform UI.
+
+```json
+"supports_resume": false
+```
+
+### `capabilities_required` — array of strings
+
+Declares which platform capabilities this resolver needs provisioned before `run()`
+is called. The platform provisions these and passes them via `config.capabilities`.
+
+```json
+"capabilities_required": ["gitea"]
+```
+
+| Capability | What the platform provides |
+|------------|--------------------------|
+| `"gitea"` | A Gitea sidecar container with a local git server, accessible from the worker |
+
+### `viewport_bundle` — string (git URL)
+
+Git URL of the viewport ESM bundle repo. If present, `amplifier-resolve resolver add`
+fetches the bundle and registers it for the frontend to load dynamically.
+
+```json
+"viewport_bundle": "git+https://github.com/myorg/my-viewport@main"
+```
+
+### `viewport_path` — string
+
+Path within the `viewport_bundle` repo to the compiled `viewport.js` ESM module.
+
+```json
+"viewport_path": "src/my_resolver_viewport/dist/viewport.js"
+```
+
+---
+
+## The `container` section
+
+The `container` object controls everything about how the resolver runs inside a
+worker container. **All `container` fields are optional.** If `container` is absent,
+the resolver runs directly using `command`.
+
+```json
+{
+  "name": "my-resolver",
+  "version": "0.1.0",
+  "description": "...",
+  "command": ["python", "-m", "my_resolver"],
+  "container": {
+    "command": ["/opt/uv-tools/amplifier/bin/python", "-m", "my_resolver"],
+    "setup_commands": [
+      "uv pip install --python /opt/uv-tools/amplifier/bin/python 'my-resolver @ git+https://github.com/myorg/my-resolver@main'"
+    ],
+    "bundles": [
+      "git+https://github.com/obra/superpowers@main"
+    ],
+    "volume_mounts": [],
+    "dev_source_overrides": ["my-resolver"]
+  }
+}
+```
+
+### `container.command` — array of strings
+
+Command to launch the resolver **inside the container**. Overrides the top-level
+`command` when running in a worker container. Typically points to the container's
+Python environment.
+
+```json
+"command": ["/opt/uv-tools/amplifier/bin/python", "-m", "my_resolver"]
+```
+
+### `container.setup_commands` — array of strings
+
+Shell commands executed sequentially during container setup, before the resolver
+process starts. Run as root inside the worker container.
+
+```json
+"setup_commands": [
+  "test -n \"${GH_TOKEN:-}\" && git config --global url.\"https://x-access-token:${GH_TOKEN}@github.com/\".insteadOf \"https://github.com/\" || true",
+  "uv pip install --python /opt/uv-tools/amplifier/bin/python 'amplifier-resolver-sdk @ git+https://github.com/microsoft/amplifier-resolver-sdk@main'",
+  "uv pip install --python /opt/uv-tools/amplifier/bin/python 'my-resolver @ git+https://github.com/myorg/my-resolver@main'"
+]
+```
+
+<Aside type="tip" title="Cached fast path">
+The worker image (`amplifier-cache:python`) pre-bakes common dependencies. Setup
+commands that re-install already-cached packages complete in ~15 seconds.
+Without the cache image, setup takes ~5 minutes for a full dependency install.
+</Aside>
+
+<Aside type="tip" title="Conditional SDK install pattern">
+Use this pattern to support both local dev (where a local SDK copy may be mounted)
+and production (where you install from GitHub):
+
+```bash
+if [ -d /opt/amplifier-resolver-sdk ]; then
+  uv pip install --reinstall --no-cache ... /opt/amplifier-resolver-sdk
+else
+  uv pip install ... 'amplifier-resolver-sdk @ git+https://github.com/microsoft/amplifier-resolver-sdk@main'
+fi
+```
+</Aside>
+
+### `container.bundles` — array of strings
+
+Amplifier bundle URLs to activate inside the container. These are loaded into the
+Amplifier session used by the resolver for LLM work.
+
+```json
+"bundles": [
+  "git+https://github.com/obra/superpowers@main"
+]
+```
+
+### `container.volume_mounts` — array
+
+Extra volumes to mount into the container. Rarely needed — most resolvers use the
+platform's workspace and data directories.
+
+```json
+"volume_mounts": []
+```
+
+### `container.dev_source_overrides` — array of strings
+
+When present, enables local development overrides. The platform looks for
+`/opt/<name>` directories inside the container and installs from them instead of
+fetching from GitHub. Used to test local changes without pushing to GitHub.
+
+```json
+"dev_source_overrides": ["sdk", "my-resolver"]
+```
+
+---
+
+## Complete real-world example
+
+The `understudy` resolver's full manifest:
+
+```json
+{
+  "name": "understudy",
+  "version": "0.2.0",
+  "description": "Understudy resolver — upfront intent alignment, theory-of-success commitments, agentic worker orchestration, independent verifier session, human approval gates.",
+  "command": ["python", "-m", "amplifier_resolver_understudy"],
+  "supports_resume": false,
+  "capabilities_required": ["gitea"],
+  "container": {
+    "command": ["/opt/uv-tools/amplifier/bin/python", "-m", "amplifier_resolver_understudy"],
+    "setup_commands": [
+      "test -n \"${GH_TOKEN:-}\" && git config --global url.\"https://x-access-token:${GH_TOKEN:-}@github.com/\".insteadOf \"https://github.com/\" || true",
+      "if [ -d /opt/amplifier-resolver-sdk ]; then uv pip install --reinstall --no-cache --python /opt/uv-tools/amplifier/bin/python /opt/amplifier-resolver-sdk; else GIT_TERMINAL_PROMPT=0 uv pip install --python /opt/uv-tools/amplifier/bin/python 'amplifier-resolver-sdk @ git+https://github.com/microsoft/amplifier-resolver-sdk@main'; fi && chmod -R a+rwX /opt/uv-tools",
+      "if [ -d /opt/amplifier-resolver-understudy ]; then uv pip install --reinstall --no-cache --python /opt/uv-tools/amplifier/bin/python /opt/amplifier-resolver-understudy; else GIT_TERMINAL_PROMPT=0 uv pip install --python /opt/uv-tools/amplifier/bin/python 'amplifier-resolver-understudy @ git+https://github.com/microsoft/amplifier-resolver-understudy@main'; fi && chmod -R a+rwX /opt/uv-tools"
+    ],
+    "dev_source_overrides": ["sdk", "understudy"],
+    "volume_mounts": [],
+    "bundles": ["git+https://github.com/obra/superpowers"]
+  },
+  "viewport_bundle": "git+https://github.com/microsoft/amplifier-resolver-understudy-viewport@main",
+  "viewport_path": "src/amplifier_resolver_understudy_viewport/dist/viewport.js"
+}
+```
+
+---
+
+## Minimal TypeScript resolver example
+
+```json
+{
+  "name": "ts-hello-world",
+  "version": "0.1.0",
+  "description": "TypeScript hello-world resolver — demonstrates polyglot support",
+  "command": ["node", "dist/hello-resolver.js"],
+  "supports_resume": false,
+  "container": {
+    "setup_commands": [
+      "cd /project && npm install && npm run build"
+    ]
+  }
+}
+```
+
+---
+
+## Field reference summary
+
+| Field | Required | Type | Description |
+|-------|----------|------|-------------|
+| `name` | ✓ | `string` | Kebab-case resolver identifier |
+| `version` | ✓ | `string` | Semver version |
+| `description` | ✓ | `string` | Human-readable summary |
+| `command` | ✓ | `string[]` | Launch command (host / fallback) |
+| `supports_resume` | | `boolean` | Enables `POST /resume` (default: `false`) |
+| `capabilities_required` | | `string[]` | Platform capabilities to provision |
+| `container.command` | | `string[]` | Launch command inside container |
+| `container.setup_commands` | | `string[]` | Setup commands run before `run()` |
+| `container.bundles` | | `string[]` | Amplifier bundles to activate |
+| `container.volume_mounts` | | `array` | Extra volume mounts |
+| `container.dev_source_overrides` | | `string[]` | Names for local dev overrides |
+| `viewport_bundle` | | `string` | Git URL of viewport ESM bundle repo |
+| `viewport_path` | | `string` | Path to `viewport.js` within bundle repo |
+
+## Registration
+
+```bash
+# Register from a local directory (development)
+amplifier-resolve resolver add ./my-resolver
+
+# Register from a git URL (production)
+amplifier-resolve resolver add 'git+https://github.com/myorg/my-resolver@main'
+
+# Verify registration
+amplifier-resolve resolver list
+curl -s "$RESOLVE_URL/api/resolvers" | jq '.[].name'
+```
+
+The backend live-reloads the resolver catalog — no restart required after `resolver add`.

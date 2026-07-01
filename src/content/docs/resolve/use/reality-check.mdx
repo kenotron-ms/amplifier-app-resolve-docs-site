@@ -1,0 +1,347 @@
+---
+title: "Reality Check"
+description: "Configuration, verdicts, SDK API, events, DTU lifecycle, and troubleshooting for the reality-check capability."
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+
+**Reality check** is the platform's automated verification system. Given a repository
+and acceptance criteria, it deploys the software into a clean-room container, runs
+validators, and returns a real `pass` / `fail` verdict. It is not a rubber stamp —
+a system that always passed would be worthless.
+
+<Aside type="note" title="This lives inside a resolver">
+Reality check is a capability that resolvers invoke from within `run()`. It is not
+a standalone API you call directly — it is orchestrated by the resolver as part of
+its verification strategy. See the [golden path](/resolve/get-started/reality-check/)
+for the end-to-end flow.
+</Aside>
+
+---
+
+## Prerequisites
+
+| Requirement | Detail |
+|-------------|--------|
+| **Feature flag** | `AMPLIFIER_RESOLVE_ENABLE_REALITY_CHECK=true` on the backend |
+| **Runner image** | Build once with `bash docker/reality-check-runner/incus-build.sh` in `amplifier-resolve/` |
+| **Runner image config** | `AMPLIFIER_RESOLVE_REALITY_CHECK_RUNNER_IMAGE=reality-check-runner` |
+| **LLM provider** | One of the supported provider credentials set in the backend environment |
+
+---
+
+## Architecture
+
+<Mermaid code={`
+flowchart TD
+    Resolver["⚙️ Your resolver\nrun()"]
+    Backend["🖥 Resolve Backend\n/instances/{id}/broker/reality-check"]
+    Runner["🏃 Runner Container\n(Incus sibling)"]
+    DTU["📦 DTU Sandbox\n(Incus sibling)\n← software deployed here\n← validators run against it"]
+    Verdict(["🏁 Verdict + report\npass · fail · partial"])
+
+    Resolver -->|"start_reality_check()"| Backend
+    Backend -->|"spawns"| Runner
+    Runner -->|"provisions"| DTU
+    DTU -->|"verdict"| Runner
+    Runner -->|"result"| Backend
+    Backend -->|"wait_for_reality_check()"| Resolver
+    Resolver --> Verdict
+`} caption="All three containers are Incus siblings — the broker manages their relationships" />
+
+All three containers live at the same Incus level — the platform manages their
+relationships via the broker. The resolver container speaks HTTP to the backend;
+the backend spawns the runner; the runner provisions the DTU.
+
+---
+
+## SDK API
+
+### `start_reality_check()` — initiate check
+
+```python
+handle = await self.start_reality_check(
+    acceptance_criteria={
+        "spec": "GET / returns 200 with body containing 'Hello'",
+        "checks": [
+            {
+                "method": "GET",
+                "path": "/",
+                "expected_status": 200,
+                "expected_body_substring": "Hello",
+            }
+        ],
+    },
+    software_path="https://github.com/example/my-app",
+    environment={"language": "python", "type": "flask", "port": 5000},
+    dtu_lifecycle="auto",     # destroy on pass; preserve on partial/fail
+    timeout_seconds=1200,     # 20 minutes (default)
+)
+```
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `acceptance_criteria` | `dict` | ✓ | Criteria object with `spec` and optional `checks` |
+| `software_path` | `str` | ✓ | Git URL or local path to the software under test |
+| `environment` | `dict` | | Language, type, port for the DTU sandbox |
+| `dtu_lifecycle` | `str` | | `"auto"` (default), `"keep"`, or `"destroy"` |
+| `timeout_seconds` | `int` | | Seconds before watchdog kills the check (default: 1200) |
+
+**`software_path` formats:**
+
+| Format | Example | Notes |
+|--------|---------|-------|
+| HTTPS git URL | `https://github.com/org/repo` | Cloned depth=1 into runner workspace |
+| git+ URL | `git+https://github.com/org/repo` | Equivalent |
+| Local path | `/project/workspace/my-app` | Must exist inside runner container |
+
+<Aside type="caution" title="SSH URLs not supported out of the box">
+`git@github.com:...` SSH URLs require the runner image to have SSH key access.
+The default runner image does not include SSH keys — use HTTPS URLs.
+</Aside>
+
+### `wait_for_reality_check()` — block until verdict
+
+```python
+result = await self.wait_for_reality_check(handle)
+```
+
+Returns a `RealityCheckResult`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `verdict` | `"pass"` \| `"fail"` \| `"partial"` \| `None` | The verdict, or `None` on infrastructure failure |
+| `failure_mode` | `str` \| `None` | `None` on pass; `"software"`, `"infrastructure"`, `"config"`, `"timeout"`, `"cancelled"` on failure |
+| `report` | `dict` | Structured report with criterion-by-criterion results |
+
+### `reality_check_events()` — stream progress
+
+```python
+async for event in self.reality_check_events(handle):
+    print(event["event_type"], event["data"])
+    await self.emit("resolver:phase", {
+        "name": f"reality_check:{event['event_type'].split('.')[-1]}"
+    })
+```
+
+---
+
+## Verdicts explained
+
+<CardGrid>
+  <Card title="pass" icon="approve-check">
+    **`verdict: "pass"`, `failure_mode: null`**
+
+    The software met all acceptance criteria. This is a real discriminating positive —
+    the check ran, deployed the software, and validators confirmed it works.
+  </Card>
+  <Card title="fail" icon="close">
+    **`verdict: "fail"`, `failure_mode: "software"`**
+
+    The software did NOT meet the criteria. This is a real, discriminating negative.
+    The check ran, deployed successfully, but validators returned failures.
+  </Card>
+  <Card title="partial" icon="warning">
+    **`verdict: "partial"`, `failure_mode: "software"`**
+
+    Some criteria passed, some failed. The software partially meets the spec.
+    DTU is preserved for inspection (with `dtu_lifecycle="auto"`).
+  </Card>
+  <Card title="infrastructure failure" icon="error">
+    **`verdict: null`, `failure_mode: "infrastructure"` (or `"config"`, `"timeout"`, `"cancelled"`)**
+
+    The check could not run — setup, connectivity, or runner problem.
+    This is NOT a statement about the software. Fix the environment and re-run.
+  </Card>
+</CardGrid>
+
+### `failure_mode` discriminator
+
+| `failure_mode` | Meaning | What to do |
+|----------------|---------|------------|
+| `null` | No failure — verdict was `pass` | Nothing |
+| `software` | Software failed validation | Fix the software |
+| `infrastructure` | Runner/DTU setup failed | Check runner image, connectivity |
+| `config` | Invalid `acceptance_criteria` or `software_path` | Fix the check configuration |
+| `timeout` | Check exceeded `timeout_seconds` | Increase timeout or optimize setup |
+| `cancelled` | `cancel_reality_check()` called or watchdog triggered | — |
+
+---
+
+## `acceptance_criteria` structure
+
+```json
+{
+  "spec": "Plain-language description of acceptance criteria",
+  "checks": [
+    {
+      "method": "GET",
+      "path": "/api/health",
+      "expected_status": 200,
+      "expected_body_contains": "{\"status\": \"ok\"}"
+    },
+    {
+      "method": "POST",
+      "path": "/api/items",
+      "body": "{\"name\": \"test\"}",
+      "expected_status": 201,
+      "expected_body_contains": "\"id\":"
+    }
+  ]
+}
+```
+
+The `spec` field is natural language — the LLM validators read it and interpret the
+intent. The `checks` array is structured and deterministic — validators run these
+as literal HTTP assertions.
+
+---
+
+## DTU lifecycle
+
+The `dtu_lifecycle` parameter controls what happens to the sandbox after the check:
+
+| Value | Behavior |
+|-------|----------|
+| `"auto"` (default) | Destroy on `pass`; preserve on `partial` or `fail` for inspection |
+| `"keep"` | Always preserve — resolver dev can call `restore_dtu` later |
+| `"destroy"` | Always destroy, regardless of verdict |
+
+**Preserved DTU bounds:**
+- Max 5 DTUs preserved per worker container
+- Max 30 DTUs preserved per host (LRU eviction)
+- TTL-purged after 24 hours
+- Destroyed when parent instance is hard-deleted (`DELETE /instances/{id}`)
+
+---
+
+## LLM provider forwarding
+
+The platform automatically forwards provider credentials from the backend environment
+into the runner sub-container:
+
+| Variable | Provider |
+|----------|---------|
+| `ANTHROPIC_API_KEY` | Anthropic (recommended) |
+| `ANTHROPIC_BASE_URL` | Anthropic custom endpoint |
+| `OPENAI_API_KEY` | OpenAI |
+| `OPENAI_BASE_URL` | OpenAI custom endpoint |
+| `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` | Azure OpenAI |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Gemini |
+| `GH_TOKEN` | GitHub Copilot |
+| `AMPLIFIER_PROVIDER` | Force a specific provider |
+| `AMPLIFIER_MODEL` | Force a specific model |
+
+**These credentials must be set on the backend host**, not in the resolver container.
+The platform reads them from the backend's environment and forwards them to the runner.
+
+---
+
+## Complete resolver example
+
+```python
+async def run(self, config, session_factory, emitter, *, resume=False):
+    # ... do implementation work first ...
+
+    # Start a reality check
+    handle = await self.start_reality_check(
+        acceptance_criteria={
+            "spec": config.params.get("acceptance_criteria",
+                    "The application starts and responds to HTTP requests"),
+            "checks": [
+                {
+                    "method": "GET",
+                    "path": "/api/health",
+                    "expected_status": 200,
+                }
+            ],
+        },
+        software_path=f"https://github.com/{config.params['repo']}",
+        environment={"language": "python", "type": "fastapi", "port": 8000},
+        dtu_lifecycle="auto",
+        timeout_seconds=1200,
+    )
+
+    # Stream progress events while waiting
+    async for event in self.reality_check_events(handle):
+        await self.emit("resolver:phase", {
+            "name": f"rc:{event['event_type'].split('.')[-1]}"
+        })
+
+    result = await self.wait_for_reality_check(handle)
+
+    await self.emit("resolver:artifact", {
+        "kind": "verdict",
+        "value": result.verdict or "unknown",
+        "metadata": {
+            "failure_mode": result.failure_mode,
+            "report": result.report,
+        }
+    })
+
+    if result.verdict == "pass":
+        # Proceed to delivery
+        await self._create_pr(config, emitter)
+        return ResolverResult(status="completed", output="PR created — reality check passed")
+    elif result.verdict == "fail":
+        # Emit failure artifact, escalate to human
+        await emitter.request_input(
+            request_id="rc-failed",
+            prompt=f"Reality check failed. Verdict: {result.verdict}, mode: {result.failure_mode}. How should we proceed?",
+            schema={
+                "type": "form",
+                "components": [{
+                    "type": "select",
+                    "id": "decision",
+                    "label": "Decision",
+                    "options": [
+                        {"value": "retry_impl", "label": "Re-implement and re-check"},
+                        {"value": "deliver_anyway", "label": "Deliver without passing reality check"},
+                        {"value": "abort", "label": "Abort"},
+                    ],
+                    "checks": []
+                }]
+            }
+        )
+        # ... handle the response in on_input_response ...
+    else:
+        # Infrastructure failure — return failed
+        return ResolverResult(
+            status="failed",
+            error=f"Reality check infrastructure failure: {result.failure_mode}"
+        )
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| HTTP 501 on broker endpoint | Feature flag not set | Set `AMPLIFIER_RESOLVE_ENABLE_REALITY_CHECK=true` on backend |
+| HTTP 401 on broker endpoint | Wrong token | Use resolver's `sub_container_token` from `config.json`, not the user-facing token |
+| `failure_mode: config` — missing required field | Runner config schema drift | Rebuild runner image from current branch |
+| `failure_mode: config` — `report.yaml` missing | LLM provider not reachable | Verify `ANTHROPIC_API_KEY` etc. set on backend host, not just in resolver container |
+| `failure_mode: config` — software_path not found | Non-existent local path | Use a git URL, or ensure path exists in runner container |
+| `failure_mode: infrastructure` — repeatedly | Container spawning issue | Check Incus status, runner image health |
+| Recipe fails with "Could not connect to Ollama" | No provider credentials, auto-init fell back to Ollama | Set a real provider credential on the backend host |
+| HTTP 429 | Per-worker cap exceeded | Wait for prior reality-check to complete before starting another |
+
+---
+
+## Reality check events
+
+Reality check events ride the same SSE stream as all other instance events:
+
+```python
+# Filter reality check events from the instance stream
+async for event in stream_events(instance_id):
+    if event["event_type"].startswith("resolve.reality_check."):
+        print(event["event_type"], event["data"].get("verdict", ""))
+```
+
+See [Event Vocabulary](/resolve/build/events/) for the full `resolve.reality_check.*`
+event catalog.

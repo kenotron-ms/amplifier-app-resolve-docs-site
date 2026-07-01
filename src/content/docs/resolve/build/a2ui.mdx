@@ -1,0 +1,409 @@
+---
+title: "A2UI Schema"
+description: "The A2UI v0.9 schema — the wire format for all interactive surfaces in Resolve: instance creation forms, input requests, and message types."
+---
+
+import { Aside, Card } from '@astrojs/starlight/components';
+
+**A2UI v0.9** is the declarative form schema used for all interactive surfaces in
+Resolve. It is the contract between resolver authors and the platform. Wherever a
+user can submit structured input — creating an instance, responding to a mid-run
+gate, sending a message — the shape of that input is described by an A2UI schema.
+
+The platform validates all incoming payloads against the declared `checks`. It never
+interprets semantic meaning — that belongs to the resolver.
+
+---
+
+## Where A2UI appears
+
+| Surface | API | A2UI Source |
+|---------|-----|-------------|
+| Instance creation form | `GET /resolvers/{name}/schema` | `resolver.instantiation_schema()` |
+| Mid-run input requests | `GET /instances/{id}/input-requests` | `emitter.request_input(schema=...)` |
+| User message types | `GET /instances/{id}/message-types` | `resolver.message_types()` |
+
+---
+
+## Schema structure
+
+An A2UI schema is a JSON object. The top-level shape:
+
+```json
+{
+  "type": "form",
+  "components": [ ...components... ]
+}
+```
+
+### Component types
+
+#### `text` — single-line text input
+
+```json
+{
+  "type": "text",
+  "id": "repo",
+  "label": "Repository",
+  "placeholder": "owner/repo",
+  "description": "GitHub repository in owner/repo format",
+  "checks": [
+    {
+      "condition": {"call": "required", "args": [{"path": "/repo"}]},
+      "message": "Repository is required"
+    },
+    {
+      "condition": {
+        "call": "regex",
+        "args": {
+          "value": {"path": "/repo"},
+          "pattern": "^[\\w.-]+/[\\w.-]+$"
+        }
+      },
+      "message": "Must be 'owner/repo' format"
+    }
+  ]
+}
+```
+
+#### `textarea` — multi-line text input
+
+```json
+{
+  "type": "textarea",
+  "id": "spec",
+  "label": "Feature Specification",
+  "placeholder": "Describe the feature to build...",
+  "description": "Plain English description. Be specific about HTTP method, path, and expected responses.",
+  "checks": [
+    {
+      "condition": {"call": "required", "args": [{"path": "/spec"}]},
+      "message": "Specification is required"
+    },
+    {
+      "condition": {
+        "call": "length",
+        "args": {"value": {"path": "/spec"}, "min": 20, "max": 10000}
+      },
+      "message": "Specification must be 20–10,000 characters"
+    }
+  ]
+}
+```
+
+#### `select` — dropdown
+
+```json
+{
+  "type": "select",
+  "id": "pipeline",
+  "label": "Pipeline",
+  "options": [
+    {"value": "quick", "label": "Quick (1-2 LLM sessions)"},
+    {"value": "standard", "label": "Standard (3-5 sessions)"},
+    {"value": "deep", "label": "Deep (consensus + verification)"}
+  ],
+  "default": "standard",
+  "checks": [
+    {
+      "condition": {"call": "required", "args": [{"path": "/pipeline"}]},
+      "message": "Pipeline selection is required"
+    }
+  ]
+}
+```
+
+#### `checkbox` — boolean toggle
+
+```json
+{
+  "type": "checkbox",
+  "id": "create_pr",
+  "label": "Create Pull Request",
+  "description": "Automatically open a PR when implementation completes",
+  "default": true
+}
+```
+
+---
+
+## Check rules (`checks`)
+
+Every component can carry a `checks` array. The platform evaluates all checks when a
+consumer submits the form. A failing check blocks submission and returns a `422` with
+the `message`.
+
+### Check structure
+
+```json
+{
+  "condition": DynamicBoolean,
+  "message": "Human-readable error shown to the user"
+}
+```
+
+A check passes when `condition` evaluates to `true`. A check fails when `condition`
+evaluates to `false` — the `message` is returned to the consumer.
+
+### `DynamicBoolean` variants
+
+| Variant | Example | Description |
+|---------|---------|-------------|
+| Literal bool | `true` | Always passes or always fails |
+| Data binding | `{"path": "/field"}` | Resolves field value, casts to bool |
+| Function call | `{"call": "required", ...}` | Runs a named validation function |
+
+---
+
+## Built-in validation functions
+
+### `required` — field must be non-empty
+
+```json
+{
+  "call": "required",
+  "args": [{"path": "/field_name"}]
+}
+```
+
+Passes when the field is present, non-null, and non-empty string.
+
+### `regex` — pattern match
+
+```json
+{
+  "call": "regex",
+  "args": {
+    "value": {"path": "/field_name"},
+    "pattern": "^[a-z][a-z0-9-]*$"
+  }
+}
+```
+
+Passes when the field value matches the regex pattern (`re.search` semantics).
+
+### `length` — string length bounds
+
+```json
+{
+  "call": "length",
+  "args": {
+    "value": {"path": "/field_name"},
+    "min": 1,
+    "max": 10000
+  }
+}
+```
+
+Both `min` and `max` are optional. Passes when `min <= len(value) <= max`.
+
+### `numeric` — numeric range
+
+```json
+{
+  "call": "numeric",
+  "args": {
+    "value": {"path": "/count"},
+    "min": 1,
+    "max": 100
+  }
+}
+```
+
+Passes when the field can be cast to a float and falls within the range.
+
+### `email` — email format
+
+```json
+{
+  "call": "email",
+  "args": [{"path": "/email"}]
+}
+```
+
+Passes when the field matches `^[\w.+-]+@[\w-]+\.\w+$`.
+
+### `and` / `or` / `not` — logical combinators
+
+```json
+{
+  "call": "and",
+  "args": {
+    "conditions": [
+      {"call": "required", "args": [{"path": "/repo"}]},
+      {"call": "regex", "args": {"value": {"path": "/repo"}, "pattern": "^[\\w.-]+/[\\w.-]+$"}}
+    ]
+  }
+}
+```
+
+```json
+{
+  "call": "not",
+  "args": {
+    "condition": {"call": "required", "args": [{"path": "/skip"}]}
+  }
+}
+```
+
+---
+
+## Data binding — `{"path": "/field"}`
+
+Path references resolve against the submitted payload. The leading `/` is stripped,
+then the remainder is split on `/` for nested access.
+
+```json
+// Submitted payload: {"database": {"host": "localhost"}}
+{"path": "/database/host"}  // resolves to "localhost"
+{"path": "/database"}       // resolves to {"host": "localhost"}
+{"path": "/missing"}        // resolves to null
+```
+
+---
+
+## Complete example: resolver instantiation schema
+
+```python
+def instantiation_schema(self, params: dict | None = None) -> dict:
+    schema = {
+        "type": "form",
+        "components": [
+            {
+                "type": "textarea",
+                "id": "spec",
+                "label": "Feature Specification",
+                "placeholder": "Add a GET /api/ping endpoint that returns {\"pong\": true}",
+                "description": "Describe observable behavior — HTTP methods, paths, status codes, response shapes.",
+                "checks": [
+                    {
+                        "condition": {"call": "required", "args": [{"path": "/spec"}]},
+                        "message": "Specification is required"
+                    },
+                    {
+                        "condition": {
+                            "call": "length",
+                            "args": {"value": {"path": "/spec"}, "min": 20}
+                        },
+                        "message": "Please provide at least 20 characters"
+                    }
+                ]
+            },
+            {
+                "type": "text",
+                "id": "repo",
+                "label": "GitHub Repository",
+                "placeholder": "myorg/myrepo",
+                "checks": [
+                    {
+                        "condition": {"call": "required", "args": [{"path": "/repo"}]},
+                        "message": "Repository is required"
+                    },
+                    {
+                        "condition": {
+                            "call": "regex",
+                            "args": {
+                                "value": {"path": "/repo"},
+                                "pattern": "^[\\w.-]+/[\\w.-]+$"
+                            }
+                        },
+                        "message": "Must be 'owner/repo' format (e.g. myorg/myrepo)"
+                    }
+                ]
+            },
+            {
+                "type": "select",
+                "id": "pipeline",
+                "label": "Pipeline",
+                "options": [
+                    {"value": "quick", "label": "Quick"},
+                    {"value": "standard", "label": "Standard"},
+                ],
+                "default": "standard",
+                "checks": []
+            }
+        ]
+    }
+
+    # Progressive disclosure: add pipeline-specific fields
+    if params and params.get("pipeline") == "deep":
+        schema["components"].append({
+            "type": "text",
+            "id": "verifier_criteria",
+            "label": "Verification Criteria",
+            "placeholder": "What must be true for the implementation to be accepted?",
+            "checks": [
+                {
+                    "condition": {"call": "required", "args": [{"path": "/verifier_criteria"}]},
+                    "message": "Verifier criteria required for deep pipeline"
+                }
+            ]
+        })
+
+    return schema
+```
+
+---
+
+## Complete example: input request schema
+
+```python
+# Inside run() — request human input at a gate
+await emitter.request_input(
+    request_id="build-gate",
+    prompt="Build failed after 3 attempts with no progress. How should we proceed?",
+    schema={
+        "type": "form",
+        "components": [
+            {
+                "type": "select",
+                "id": "decision",
+                "label": "Decision",
+                "options": [
+                    {"value": "retry", "label": "Retry (give it more attempts)"},
+                    {"value": "abort", "label": "Abort (mark instance as failed)"},
+                    {"value": "skip_tests", "label": "Skip tests and deliver as-is"},
+                ],
+                "checks": [
+                    {
+                        "condition": {"call": "required", "args": [{"path": "/decision"}]},
+                        "message": "Please select a decision"
+                    }
+                ]
+            },
+            {
+                "type": "textarea",
+                "id": "notes",
+                "label": "Notes (optional)",
+                "placeholder": "Any context for the resolver...",
+                "checks": []
+            }
+        ]
+    }
+)
+```
+
+---
+
+## Validation errors
+
+When check validation fails, the platform returns HTTP `422`:
+
+```json
+{
+  "detail": "Validation failed",
+  "errors": [
+    "Repository is required",
+    "Must be 'owner/repo' format"
+  ]
+}
+```
+
+All failing check messages are returned together — the consumer sees all errors at once.
+
+<Aside type="note" title="Platform validates structure, resolver validates semantics">
+The platform runs your check rules against the submitted payload and rejects invalid
+submissions. It does NOT interpret what your fields mean — whether a repo actually
+exists, whether a spec is coherent, whether the pipeline name makes sense to your
+logic. All semantic validation belongs in your resolver's `run()`.
+</Aside>

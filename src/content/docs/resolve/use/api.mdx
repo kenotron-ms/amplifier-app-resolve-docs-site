@@ -1,0 +1,770 @@
+---
+title: "REST API Reference"
+description: "Complete reference for every Resolve endpoint — resolver discovery, instance lifecycle, events, input requests, messages, data files, and reality checks."
+---
+
+import { Aside, Card } from '@astrojs/starlight/components';
+
+**Base URL:** `http://<host>:<port>` (default: `http://localhost:10120`)
+
+All request and response bodies are JSON. Interactive documentation (Swagger UI) is
+available at `/docs` and OpenAPI spec at `/openapi.json`.
+
+**Authentication:** see [Auth Model](/resolve/use/auth/). When auth is enabled, pass
+`Authorization: Bearer <token>` on all requests. For SSE connections, use
+`?token=<token>` query param instead.
+
+---
+
+## Quick reference
+
+```
+Health
+  GET  /api/health
+
+Auth
+  GET  /api/auth/status
+  POST /api/auth/verify
+
+Resolver discovery
+  GET  /resolvers
+  GET  /resolvers/{name}/schema
+
+Instances
+  POST   /instances                         create
+  GET    /instances                         list (filter by status, resolver)
+  GET    /instances/{id}                    get
+  DELETE /instances/{id}                    cancel
+  PATCH  /instances/{id}                    rename
+  POST   /instances/{id}/resume             resume paused
+  POST   /instances/{id}/stop              graceful stop
+
+Events & state
+  GET  /instances/{id}/events               SSE stream
+  GET  /instances/{id}/state                current state snapshot
+
+Input requests (resolver → user)
+  GET  /instances/{id}/input-requests
+  GET  /instances/{id}/input-requests/{rid}
+  POST /instances/{id}/input-requests/{rid}
+
+User messages (user → resolver)
+  GET  /instances/{id}/message-types
+  POST /instances/{id}/messages
+  GET  /instances/{id}/messages
+
+Data files
+  GET  /instances/{id}/data/{path}
+
+Session transcripts
+  GET  /instances/{id}/sessions/{sid}/transcript
+
+Workspace
+  GET  /instances/{id}/workspace/status
+  GET  /instances/{id}/workspace/repos
+  GET  /instances/{id}/workspace-tree
+  GET  /instances/{id}/workspace-git-status
+  GET  /instances/{id}/workspace/{path}
+
+Reality check (broker)
+  GET  /broker/environments
+  POST /instances/{id}/broker/reality-check
+  GET  /instances/{id}/broker/reality-check/{session_id}
+```
+
+---
+
+## Health
+
+### `GET /api/health`
+
+```bash
+curl http://localhost:10120/api/health
+```
+
+```json
+{"status": "ok"}
+```
+
+Also available at `GET /health` (without the `/api` prefix).
+
+---
+
+## Auth
+
+### `GET /api/auth/status`
+
+Check whether authentication is required.
+
+```bash
+curl http://localhost:10120/api/auth/status
+```
+
+```json
+{"required": false}
+```
+
+### `POST /api/auth/verify`
+
+Verify a bearer token.
+
+```bash
+curl -X POST http://localhost:10120/api/auth/verify \
+  -H "Content-Type: application/json" \
+  -d '{"token": "your-token-here"}'
+```
+
+```json
+{"valid": true}
+```
+
+---
+
+## Resolver discovery
+
+### `GET /resolvers`
+
+List all registered resolvers with their name, description, and A2UI instantiation schema.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:10120/resolvers
+```
+
+**Response 200:**
+
+```json
+[
+  {
+    "name": "understudy",
+    "description": "Understudy resolver — upfront intent alignment, theory-of-success commitments...",
+    "schema": {
+      "type": "form",
+      "components": [
+        {"type": "textarea", "id": "spec", "label": "Feature Specification", ...},
+        {"type": "text", "id": "repo", "label": "Repository (owner/name)", ...}
+      ]
+    }
+  },
+  {
+    "name": "dot-graph",
+    "description": "DOT-format attractor pipeline resolver",
+    "schema": { ... }
+  }
+]
+```
+
+### `GET /resolvers/{name}/schema`
+
+Get the instantiation schema for a specific resolver. Supports progressive disclosure
+via the optional `params` query parameter.
+
+```bash
+# Static schema
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:10120/resolvers/understudy/schema"
+
+# Dynamic schema — resolver refines fields based on current params
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:10120/resolvers/dot-graph/schema?params=%7B%22pipeline%22%3A%22deep%22%7D"
+```
+
+**Query parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `params` | Optional JSON string. Resolver may return different fields based on context |
+
+**Response 200:** A2UI schema object (same as `schema` field in `GET /resolvers`)
+
+**Response 404:** `{"detail": "Resolver not found"}`
+
+**Response 422:** `{"detail": "Invalid JSON in params"}`
+
+---
+
+## Instances
+
+### `POST /instances` — create
+
+Create a new instance. Validates `input` against the resolver's A2UI schema, persists
+the instance, and launches the resolver container in the background.
+
+```bash
+curl -X POST http://localhost:10120/instances \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "resolver": "understudy",
+    "input": {
+      "spec": "Add a GET /api/ping endpoint that returns {\"pong\": true}",
+      "repo": "myorg/myrepo"
+    }
+  }'
+```
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `resolver` | `string` | ✓ | Resolver name (from `GET /resolvers`) |
+| `input` | `object` | ✓ | Resolver-specific input, validated against the resolver's A2UI schema |
+
+**Response 202:**
+
+```json
+{
+  "instance_id": "a1b2c3d4e5f6",
+  "name": "add-ping-endpoint",
+  "resolver": "understudy",
+  "status": "created",
+  "supports_resume": false,
+  "resolver_state": {},
+  "created_at": "2026-03-08T10:13:58Z",
+  "updated_at": "2026-03-08T10:13:58Z"
+}
+```
+
+**Response 404:** `{"detail": "Resolver not found"}`
+
+**Response 422:**
+```json
+{
+  "detail": "Validation failed",
+  "errors": ["'spec' is a required property"]
+}
+```
+
+---
+
+### `GET /instances` — list
+
+List all instances, optionally filtered. Results are sorted newest-first.
+
+```bash
+# All instances
+curl -H "Authorization: Bearer $TOKEN" http://localhost:10120/instances
+
+# Only running
+curl -H "Authorization: Bearer $TOKEN" "http://localhost:10120/instances?status=running"
+
+# By resolver
+curl -H "Authorization: Bearer $TOKEN" "http://localhost:10120/instances?resolver=understudy"
+
+# Combined
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:10120/instances?status=running&resolver=understudy"
+```
+
+**Query parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `status` | Filter: `created` \| `starting` \| `running` \| `awaiting_input` \| `paused` \| `completed` \| `failed` \| `cancelled` |
+| `resolver` | Filter by resolver name |
+
+**Response 200:** Array of `InstanceStatus` objects.
+
+---
+
+### `GET /instances/{id}` — get
+
+Full detail for a specific instance.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:10120/instances/a1b2c3d4e5f6
+```
+
+**Response 200:** `InstanceStatus` object (see schema below)
+
+**Response 404:** `{"detail": "Instance not found"}`
+
+---
+
+### `DELETE /instances/{id}` — cancel
+
+Cancel a running instance. Stops the container (best-effort) and sets status to
+`cancelled`.
+
+```bash
+curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+  http://localhost:10120/instances/a1b2c3d4e5f6
+```
+
+**Response 200:** Updated `InstanceStatus` with `status: "cancelled"`
+
+---
+
+### `PATCH /instances/{id}` — rename
+
+Update mutable instance fields.
+
+```bash
+curl -X PATCH http://localhost:10120/instances/a1b2c3d4e5f6 \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "add-rate-limiting"}'
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `string` | New human-readable name |
+
+**Response 200:** Updated `InstanceStatus`
+
+---
+
+### `POST /instances/{id}/resume` — resume
+
+Resume a paused instance. Only valid when `status: "paused"` and `supports_resume: true`.
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  http://localhost:10120/instances/a1b2c3d4e5f6/resume
+```
+
+**Response 200:** Updated `InstanceStatus` with `status: "running"`
+
+**Response 409:** `{"detail": "Instance is not paused or does not support resume"}`
+
+---
+
+### `POST /instances/{id}/stop` — graceful stop
+
+Request graceful stop. Calls `resolver.stop(reason)` to allow the resolver to
+checkpoint before termination.
+
+```bash
+curl -X POST http://localhost:10120/instances/a1b2c3d4e5f6/stop \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "no longer needed"}'
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `reason` | `string` | Reason for stopping (default: `"user_requested"`) |
+
+**Response 200:** Updated `InstanceStatus`
+
+**Response 409:** `{"detail": "Instance is not running"}`
+
+---
+
+## Events & state
+
+### `GET /instances/{id}/events` — SSE stream
+
+Stream events using Server-Sent Events. Each event is sent as `data: {json}`. The
+stream closes with `data: {"type": "done"}` when the instance reaches a terminal status.
+
+```bash
+# With header auth (curl, server-to-server)
+curl -N -H "Authorization: Bearer $TOKEN" \
+  http://localhost:10120/instances/a1b2c3d4e5f6/events
+
+# With query param (EventSource, SSE clients that can't set headers)
+curl -N "http://localhost:10120/instances/a1b2c3d4e5f6/events?token=$TOKEN"
+```
+
+**SSE stream format:**
+
+```
+data: {"schema_version":1,"event_type":"resolve.container.creating","instance_id":"a1b2c3d4e5f6","timestamp":"...","data":{}}
+
+data: {"schema_version":1,"event_type":"resolve.worker.ready","instance_id":"a1b2c3d4e5f6","timestamp":"...","data":{}}
+
+data: {"schema_version":1,"event_type":"resolver:phase","instance_id":"a1b2c3d4e5f6","timestamp":"...","data":{"name":"planning"}}
+
+data: {"type":"done"}
+```
+
+**Python streaming example:**
+
+```python
+import json, requests
+
+def stream_events(instance_id: str, base_url: str, token: str):
+    url = f"{base_url}/api/instances/{instance_id}/events?token={token}"
+    with requests.get(url, stream=True) as resp:
+        for line in resp.iter_lines():
+            if line:
+                text = line.decode()
+                if text.startswith("data: "):
+                    event = json.loads(text[6:])
+                    yield event
+                    if event.get("type") == "done":
+                        break
+```
+
+**Response 404:** Instance not found or no events file yet.
+
+---
+
+### `GET /instances/{id}/state` — current state snapshot
+
+Read the current `state.json` — a point-in-time snapshot of the instance's status
+and phase. Updated atomically on each transition.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:10120/instances/a1b2c3d4e5f6/state
+```
+
+**Response 200:**
+
+```json
+{
+  "instance_id": "a1b2c3d4e5f6",
+  "status": "running",
+  "phase": "implementing",
+  "updated_at": "2026-03-08T10:35:00.123456+00:00"
+}
+```
+
+Additional fields may be present depending on resolver and phase:
+
+| Field | When | Description |
+|-------|------|-------------|
+| `phase` | During processing | Current resolver phase name |
+| `sessions_used` | After completion | Total LLM sessions consumed |
+| `error` | On failure | Error description |
+
+---
+
+## Input requests (resolver → user)
+
+When a resolver needs human input at runtime, it writes a structured request with an
+A2UI form schema. The instance transitions to `awaiting_input`.
+
+### `GET /instances/{id}/input-requests`
+
+```bash
+# All requests
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:10120/instances/a1b2c3d4e5f6/input-requests
+
+# Only pending
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:10120/instances/a1b2c3d4e5f6/input-requests?status=pending"
+```
+
+**Response 200:**
+
+```json
+[
+  {
+    "id": "build-gate",
+    "status": "pending",
+    "prompt": "Build failed after 3 attempts. How should we proceed?",
+    "schema": {
+      "type": "form",
+      "components": [
+        {
+          "type": "select",
+          "id": "decision",
+          "label": "Decision",
+          "options": [
+            {"value": "retry", "label": "Retry"},
+            {"value": "abort", "label": "Abort"}
+          ],
+          "checks": [...]
+        }
+      ]
+    }
+  }
+]
+```
+
+### `GET /instances/{id}/input-requests/{rid}`
+
+Get a specific request by ID.
+
+### `POST /instances/{id}/input-requests/{rid}` — respond
+
+Submit a response. Payload is validated against the request's A2UI schema.
+
+```bash
+curl -X POST http://localhost:10120/instances/a1b2c3d4e5f6/input-requests/build-gate \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"decision": "retry"}'
+```
+
+**Response 204:** Response accepted (no body). Instance transitions back to `running`.
+
+**Response 422:** Schema validation failed.
+
+---
+
+## User messages (user → resolver)
+
+Unsolicited messages let you steer a running instance without waiting for it to ask.
+
+### `GET /instances/{id}/message-types`
+
+Get the message types the resolver currently accepts (dynamic by phase/state).
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:10120/instances/a1b2c3d4e5f6/message-types
+```
+
+**Response 200:**
+
+```json
+[
+  {
+    "name": "user_feedback",
+    "label": "Send Feedback",
+    "description": "Steer the resolver with free-text feedback",
+    "schema": {
+      "type": "form",
+      "components": [
+        {"type": "textarea", "id": "text", "label": "Feedback", "checks": [...]}
+      ]
+    }
+  }
+]
+```
+
+### `POST /instances/{id}/messages` — send
+
+```bash
+curl -X POST http://localhost:10120/instances/a1b2c3d4e5f6/messages \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message_type": "user_feedback", "payload": {"text": "Also add input validation"}}'
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `message_type` | `string` | Must be in `GET /message-types` for current state |
+| `payload` | `object` | Message payload (validated against message type schema) |
+
+**Response 202:** `{"accepted": true}`
+
+**Response 422:** Unknown message type or schema validation failure.
+
+### `GET /instances/{id}/messages`
+
+List all messages sent to this instance, in order.
+
+---
+
+## Data files
+
+### `GET /instances/{id}/data/{path}`
+
+Fetch a file from the resolver's data directory (`/project/.resolve/data/{path}`)
+inside the running container. Resolvers write files there; viewports and external
+tools read them on demand.
+
+```bash
+# Fetch a DOT graph file written by the resolver
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:10120/instances/a1b2c3d4e5f6/data/graph.dot
+
+# Fetch a progress JSON file
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:10120/instances/a1b2c3d4e5f6/data/progress.json
+
+# Fetch from a subdirectory
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:10120/instances/a1b2c3d4e5f6/data/nodes/abc123/response.md
+```
+
+- Path traversal is blocked (`..` and absolute paths return `400`)
+- Content-type auto-detected from file extension
+- Returns `404` if file does not exist in the container
+- Returns `502` if the container is unreachable
+
+---
+
+## Session transcripts
+
+### `GET /instances/{id}/sessions/{session_id}/transcript`
+
+Returns a filtered transcript of a child Amplifier session's conversation. The
+`session_id` comes from `pipeline:node_complete` events.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:10120/instances/a1b2c3d4e5f6/sessions/9c9475dc-c9fe-4c13-9af5-db6b00a59ad7/transcript"
+```
+
+**Response 200:**
+
+```json
+{
+  "session_id": "9c9475dc-c9fe-4c13-9af5-db6b00a59ad7",
+  "events": [
+    {"type": "prompt:submit", "timestamp": "...", "data": {"prompt": "..."}},
+    {"type": "content_block:end", "timestamp": "...", "data": {"text": "I'll start by..."}}
+  ],
+  "meta": {"total_lines": 113, "extracted_events": 47, "truncated_fields": 0}
+}
+```
+
+Filters to conversation-relevant events only. `llm:request` events (which contain
+full accumulated context windows) are excluded.
+
+---
+
+## Reality check (broker)
+
+### `GET /broker/environments`
+
+List all active broker-managed DTU environments.
+
+### `POST /instances/{id}/broker/reality-check`
+
+Request a reality check against the current workspace state.
+
+```bash
+curl -X POST http://localhost:10120/instances/a1b2c3d4e5f6/broker/reality-check \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "acceptance_criteria": {
+      "spec": "GET /api/ping returns 200 with body {\"pong\": true}"
+    },
+    "software_path": "https://github.com/myorg/myrepo",
+    "environment": {"language": "python", "type": "flask"}
+  }'
+```
+
+**Response 202:**
+```json
+{"session_id": "rc-abc123", "status_url": "...", "sse_url": "..."}
+```
+
+<Aside type="note" title="Feature flag required">
+This endpoint returns HTTP 501 unless `AMPLIFIER_RESOLVE_ENABLE_REALITY_CHECK=true`
+is set on the backend.
+</Aside>
+
+### `GET /instances/{id}/broker/reality-check/{session_id}`
+
+Get the current status and result of a reality-check session.
+
+**Response 200:**
+```json
+{"status": "completed", "verdict": "pass", "report": {...}}
+```
+
+---
+
+## `InstanceStatus` schema
+
+All instance endpoints return this shape:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `instance_id` | `string` | Unique 12-character hex identifier |
+| `name` | `string` | Human-readable name (auto-generated or set via PATCH) |
+| `resolver` | `string` | Resolver handling this instance |
+| `status` | `string` | `created` \| `starting` \| `running` \| `awaiting_input` \| `paused` \| `completed` \| `failed` \| `cancelled` |
+| `supports_resume` | `boolean` | Whether POST /resume is available |
+| `resolver_state` | `object` | Resolver-specific progress data |
+| `created_at` | `string` | ISO 8601 creation timestamp |
+| `updated_at` | `string` | ISO 8601 last-update timestamp |
+
+---
+
+## Status codes
+
+| Code | Meaning | When |
+|------|---------|------|
+| `200` | OK | GET, DELETE, PATCH |
+| `202` | Accepted | POST instances, POST messages (async processing started) |
+| `204` | No Content | POST input-request response (accepted, no body) |
+| `400` | Bad Request | Invalid path (data endpoint), malformed request |
+| `401` | Unauthorized | Missing or invalid token |
+| `404` | Not Found | Instance, resolver, or resource does not exist |
+| `409` | Conflict | Resume on non-paused instance, stop on non-running instance |
+| `422` | Unprocessable Entity | Input validation failed, unknown message type, bad JSON |
+| `501` | Not Implemented | Feature flag not enabled (reality check) |
+| `502` | Bad Gateway | Container unreachable (data endpoint) |
+
+---
+
+## Common patterns
+
+### Create and monitor with bash
+
+```bash
+#!/usr/bin/env bash
+RESOLVE_URL="http://localhost:10120"
+TOKEN=$(cat ~/.amplifier/resolve/token)
+
+# 1. Create instance
+INSTANCE_ID=$(curl -s -X POST "$RESOLVE_URL/instances" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"resolver": "understudy", "input": {"spec": "Add GET /ping", "repo": "myorg/myrepo"}}' \
+  | jq -r '.instance_id')
+
+echo "Instance: $INSTANCE_ID"
+
+# 2. Stream events until done
+curl -N -s "$RESOLVE_URL/instances/$INSTANCE_ID/events?token=$TOKEN" \
+  | while IFS= read -r line; do
+    [[ "$line" == data:* ]] || continue
+    EVENT="${line#data: }"
+    echo "$EVENT" | jq -r '"[\(.event_type)] \(.data.name // "")"'
+    echo "$EVENT" | jq -e '.type == "done"' > /dev/null 2>&1 && break
+  done
+
+# 3. Final state
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$RESOLVE_URL/instances/$INSTANCE_ID" | jq '{status, resolver_state}'
+```
+
+### Handle input requests with Python
+
+```python
+import time, json, requests
+
+BASE = "http://localhost:10120"
+TOKEN = open(os.path.expanduser("~/.amplifier/resolve/token")).read().strip()
+HEADERS = {"Authorization": f"Bearer {TOKEN}"}
+
+def run_with_human_in_loop(resolver: str, input_data: dict, auto_respond=None):
+    # Create
+    resp = requests.post(f"{BASE}/instances", json={"resolver": resolver, "input": input_data}, headers=HEADERS)
+    instance_id = resp.json()["instance_id"]
+    print(f"Instance: {instance_id}")
+
+    while True:
+        instance = requests.get(f"{BASE}/instances/{instance_id}", headers=HEADERS).json()
+        status = instance["status"]
+        print(f"Status: {status}")
+
+        if status in ("completed", "failed", "cancelled"):
+            return instance
+
+        if status == "awaiting_input":
+            reqs = requests.get(
+                f"{BASE}/instances/{instance_id}/input-requests?status=pending",
+                headers=HEADERS
+            ).json()
+            for req in reqs:
+                print(f"Input request: {req['prompt']}")
+                if auto_respond:
+                    payload = auto_respond(req)
+                    requests.post(
+                        f"{BASE}/instances/{instance_id}/input-requests/{req['id']}",
+                        json=payload, headers=HEADERS
+                    )
+                else:
+                    # Human decision point — print schema and wait
+                    print(json.dumps(req["schema"], indent=2))
+                    decision = input("Response (JSON): ")
+                    requests.post(
+                        f"{BASE}/instances/{instance_id}/input-requests/{req['id']}",
+                        json=json.loads(decision), headers=HEADERS
+                    )
+
+        time.sleep(10)
+```

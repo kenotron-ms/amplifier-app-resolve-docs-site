@@ -1,0 +1,249 @@
+---
+title: "Platform Architecture"
+description: "How Resolve works — the host, the resolver, the container, and how they wire together."
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+
+Resolve is a multi-repo autonomous code generation platform. Its architecture separates
+concerns across a clear boundary: the **platform host** (FastAPI backend) owns
+infrastructure — container lifecycle, event routing, API surface. The **resolver**
+(plugin process) owns semantics — what to build, how to build it, what the output means.
+
+---
+
+## System diagram
+
+<Mermaid code={`
+flowchart TB
+    Consumer(["👤 Consumer\nSPA · curl · Python · Agent"])
+
+    subgraph FastAPI ["🖥  Resolve Backend"]
+        direction LR
+        Routes["Routes\n/instances /resolvers\n/events /data"]
+        Orch["Orchestrator\ncontainer lifecycle"]
+        Mon["Monitor\npoll loop"]
+        Auth["AuthMiddleware\nbearer token"]
+        Store["InstanceStore\nstate persistence"]
+        EB["EventBus\nSSE fan-out"]
+        Auth --> Routes
+        Routes --> Orch
+        Routes --> Store
+        Mon --> EB
+    end
+
+    subgraph Incus ["📦 Incus Containers"]
+        W["resolve-{id}\nWorker"]
+        G["resolve-{id}-gitea\nGitea sidecar"]
+        RC["resolve-{id}-env-{uuid}\nRC runner (optional)"]
+    end
+
+    Consumer -->|"REST + SSE"| FastAPI
+    Orch -->|"create · setup · launch"| W
+    W -->|"events.jsonl\nstate.json"| Mon
+    EB -->|SSE| Consumer
+    W -.- G
+    W -.- RC
+`} caption="Platform architecture — host manages infrastructure, resolver owns business logic" />
+
+---
+
+## Component responsibilities
+
+### Platform host
+
+The backend owns all infrastructure concerns. It provides mechanisms, never policies.
+
+| Component | File | Responsibility |
+|-----------|------|---------------|
+| **Routes** | `routes/instances.py`, `routes/resolvers.py` | REST API for all consumer interactions |
+| **Orchestrator** | `orchestrator.py` | Container lifecycle: create, setup, launch, poll, cancel, resume |
+| **Monitor** | `monitor.py` | Background loop: mirror events, discover input-requests, extract state |
+| **InstanceStore** | `storage.py` | Persist instance records and status |
+| **EventBus** | internal | Fan-out SSE events to connected consumers |
+| **ManifestRegistry** | `plugins/manifest.py` | Load resolver catalog from `resolvers.json` |
+| **ContainerProvider** | `containers/` | Incus-first, Docker-fallback container operations |
+| **AuthMiddleware** | `auth.py` | Bearer token validation |
+| **Broker** | `broker/` | Reality-check orchestration: DTU environments, runner lifecycle |
+
+### Resolver (plugin process)
+
+The resolver runs inside the worker container as a separate process. It owns all
+semantic concerns:
+
+| Responsibility | Description |
+|---------------|-------------|
+| Instantiation schema | What fields to ask for when creating an instance |
+| Workspace setup | Which repos to clone, which branch to work on |
+| Business logic | What `run()` does — all planning, implementation, verification |
+| Event emission | What events to emit and when (phase, artifact, completion) |
+| Input requests | When to pause and ask the user for input |
+| Message handling | What unsolicited messages to accept and how to respond |
+| Output artifacts | PR URLs, branch names, reports, summaries |
+
+---
+
+## Three A2UI interaction surfaces
+
+<Mermaid code={`
+flowchart TD
+    subgraph S1 ["📝 Instantiation — before instance exists"]
+        direction LR
+        C1["Consumer"] -->|"GET /resolvers/{name}/schema"| P1["Platform"] -->|calls| R1["resolver.instantiation_schema()"]
+    end
+
+    subgraph S2 ["🚦 Input Requests — during execution, resolver-initiated"]
+        direction LR
+        R2["Resolver"] -->|"emitter.request_input()"| P2["Platform"] -->|exposes| IR["GET /input-requests"]
+        C2["Consumer"] -->|"POST /input-requests/{id}"| P2
+    end
+
+    subgraph S3 ["💬 Messages — anytime, consumer-initiated"]
+        direction LR
+        C3["Consumer"] -->|"GET /message-types"| P3["Platform"] -->|calls| R3["resolver.message_types()"]
+        C3 -->|"POST /messages"| P3 -->|calls| R4["resolver.on_message()"]
+    end
+`} caption="Platform validates structure (A2UI check rules) — resolver interprets semantic meaning" />
+
+A2UI v0.9 is the wire format for all three surfaces. The platform validates incoming
+payloads against check rules; the resolver interprets semantic meaning.
+
+---
+
+## Data bus: on-demand file serving
+
+```
+Resolver writes:   /project/.resolve/data/graph.dot
+                   /project/.resolve/data/progress.json
+                   /project/.resolve/data/nodes/abc123/response.md
+
+Consumer fetches:  GET /instances/{id}/data/graph.dot
+                   GET /instances/{id}/data/progress.json
+                   GET /instances/{id}/data/nodes/abc123/response.md
+
+Resolver signals:  resolver.data_changed ← event with affected paths
+Viewport reacts:   fetchData(path) per each changed path
+```
+
+Data is never pushed — never polled — always fetched on demand. The resolver signals
+what changed; consumers decide what to re-fetch.
+
+---
+
+## Container runtime
+
+The platform uses **Incus** as the primary container runtime for all worker containers
+and sidecars in local and DTU deployments. Docker is supported as a fallback and for
+future remote deployments.
+
+```
+detect_runtime()
+    ├── incus available? → use IncusProvider
+    └── docker available? → use DockerProvider (fallback)
+```
+
+**Container naming:**
+
+| Container | Purpose |
+|-----------|---------|
+| `resolve-{id}` | Main resolver container for instance `{id}` |
+| `resolve-{id}-gitea` | Gitea sidecar (when `capabilities_required: ["gitea"]`) |
+| `resolve-{id}-env-{uuid}` | Ephemeral sub-container for sandboxed steps |
+
+---
+
+## Two startup paths
+
+```
+Cached fast path (~15 seconds):
+  Image: amplifier-cache:python
+  Has: uv, Python env, pre-installed common packages
+  Setup: install resolver + SDK from cache or GitHub, write config
+
+Cold path (~5 minutes):
+  Image: ghcr.io/astral-sh/uv:python3.13-trixie-slim
+  Has: bare Python
+  Setup: apt packages, CLI tools, provider SDKs, pipeline engine,
+         git identity/auth, repo clone, bundle activation
+```
+
+The platform selects the fast path when `amplifier-cache:python` exists locally.
+Build it once:
+
+```bash
+cd amplifier-resolve
+bash scripts/build-cache-image.sh
+```
+
+---
+
+## Request lifecycle: `POST /instances`
+
+<Mermaid code={`
+sequenceDiagram
+    autonumber
+    participant C  as Consumer
+    participant RT as Routes
+    participant O  as Orchestrator
+    participant W  as Worker Container
+    participant M  as Monitor
+
+    C->>RT: POST /instances {resolver, input}
+    RT->>RT: validate A2UI schema
+    RT-->>C: 202 {instance_id, status: created}
+    RT->>O: start_instance() [background]
+    O->>W: create + start container
+    O->>W: run setup_commands
+    O->>W: launch resolver.run()
+    activate W
+    loop Until terminal state
+        W->>W: emit to events.jsonl
+        M->>W: poll events.jsonl
+        M-->>C: SSE push (/events)
+    end
+    W-->>O: ResolverResult
+    deactivate W
+    O->>RT: update status → completed
+`} caption="Request lifecycle — from POST /instances to the final SSE done event" />
+
+---
+
+## Platform vs resolver: the bright line
+
+**The platform validates structure, never interprets meaning.**
+
+| Concern | Platform | Resolver |
+|---------|----------|----------|
+| Container create/start/stop/destroy | ✓ | |
+| A2UI schema validation | ✓ struct. only | ✓ semantic meaning |
+| Input request storage + routing | ✓ | ✓ schema + handling |
+| Message delivery | ✓ | ✓ catalog + handling |
+| LLM session creation | ✓ factory | ✓ what to ask |
+| Event streaming | ✓ mirror + SSE | ✓ what to emit |
+| Repo cloning | ✓ mechanics | ✓ which repos |
+| Business logic | | ✓ everything |
+
+If two teams could want different behavior → it's a resolver concern, not a platform
+concern.
+
+---
+
+## Key source files
+
+| File | Role |
+|------|------|
+| `app.py` | FastAPI app: routes, middleware, lifespan, monitor start |
+| `routes/instances.py` | Instance CRUD, events, input-requests, messages, data |
+| `routes/resolvers.py` | Resolver discovery, schema endpoints |
+| `orchestrator.py` | Container lifecycle: create, inject, launch, poll, cancel |
+| `monitor.py` | Background loop: event mirror, input-request discovery, status |
+| `storage.py` | `InstanceStore`: persistent instance state |
+| `auth.py` | `AuthMiddleware`: bearer token validation |
+| `containers/incus.py` | Incus container provider implementation |
+| `broker/reality_check.py` | Reality-check orchestration via broker |
+| `core/resolve_worker.py` | Container-side worker entry point |
+| `core/resolve_core.py` | Dispatches to selected resolver implementation |
+| `core/resolver.py` | `Resolver` Protocol + `ResolverResult` |
+| `core/events.py` | `EventEmitter`: structured event writing + state |
+| `plugins/manifest.py` | `ManifestRegistry`: resolver catalog management |
